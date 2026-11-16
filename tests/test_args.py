@@ -1322,6 +1322,95 @@ def test_mcp_put_dir():
             assert m._put() == (d, "/dest")
 
 
+def test_async():
+    import asyncio
+    import copy
+    import inspect
+    import time
+
+    from agvisor import aio
+
+    calls = []
+
+    def run(cmd, **_):  # a docker that takes 0.3 s per call
+        calls.append(cmd)
+        time.sleep(0.3)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    async def scenario():
+        ticks = 0
+
+        async def ticker():  # the event loop must keep turning while docker is slow
+            nonlocal ticks
+            while True:
+                await asyncio.sleep(0.01)
+                ticks += 1
+
+        tick = asyncio.create_task(ticker())
+        async with aio.AsyncSandbox(limits=Limits(cpus=1)) as sb:
+            assert isinstance(sb, aio.AsyncSandbox) and sb.name.startswith("agvisor-") and sb._running  # attributes pass through
+            assert calls[-1][1] == "run" and "--cpus=1" in calls[-1]  # same arguments as Sandbox
+            t0, before = time.monotonic(), ticks
+            rs = await asyncio.gather(*(sb.exec("x") for _ in range(5)))
+            assert time.monotonic() - t0 < 1.0 and ticks - before > 10, "the calls ran one after the other, or blocked the loop"
+            assert [r.returncode for r in rs] == [0] * 5 and calls[-1][1:4] == ["exec", "-i", sb.name]
+
+            try:  # cancelling the wait: the loop is free again at once (the thread finishes by itself)
+                await asyncio.wait_for(sb.exec("slow"), 0.05)
+            except TimeoutError:
+                pass
+            else:
+                raise AssertionError("did not time out")
+            await asyncio.sleep(0.4)
+
+            threads = []
+            with mock.patch.object(Sandbox, "_stream", lambda self, *a, on_output: (on_output("a"), on_output("b"), subprocess.CompletedProcess(a, 0, "ab", ""))[2]):
+                got = []
+
+                async def on_async(text):
+                    got.append(text)
+                    threads.append(threading.current_thread() is threading.main_thread())
+
+                assert (await sb.exec("x", on_output=on_async)).stdout == "ab" and got == ["a", "b"]
+                got.clear()
+                await sb.exec("x", on_output=lambda text: (got.append(text), threads.append(threading.current_thread() is threading.main_thread())))
+                assert got == ["a", "b"]
+            assert threads == [True, True, False, False]  # an async callback runs on the loop, a plain one in the worker thread
+
+            seen = []
+            sb._obj.exec = lambda cmd, **kw: (seen.append(cmd), subprocess.CompletedProcess([], 0, "3\n", ""))[1]
+            job = await sb.spawn("x")  # a Job that is awaited, too
+            assert isinstance(job, aio.AsyncJob) and re.fullmatch(r"[0-9a-f]{12}", job.id)
+            assert await job.poll() == 3 and job.returncode == 3 and await job.wait() == 3
+            await job.kill()
+
+            def gone(cmd, **kw):
+                raise SandboxGone("agvisor-x is gone")
+
+            sb._obj.exec = gone
+            try:
+                await sb.put("/x", b"")
+            except SandboxGone:
+                pass
+            else:
+                raise AssertionError("an error in the thread must reach the caller")
+
+            assert not hasattr(sb, "nothing") and copy.copy(sb)._obj is sb._obj  # no endless __getattr__ on a bare copy
+            assert inspect.iscoroutinefunction(aio.AsyncSandbox.exec) and "timeout" in inspect.signature(aio.AsyncSandbox.exec).parameters
+        assert calls[-1][1:3] == ["rm", "-f"]  # `async with` stopped it
+        tick.cancel()
+
+        with mock.patch.object(aio, "_list_sandboxes", lambda host, owner: [Sandbox(name="a", owner=owner)]):
+            (one,) = await aio.list_sandboxes("ssh://u@vm", "me")
+            assert isinstance(one, aio.AsyncSandbox) and one.name == "agvisor-a" and one.owner == "me"
+        box = await aio.create_sandbox(host=None)
+        assert isinstance(box, aio.AsyncSandbox) and box._running
+        assert await box.stop() is None and not box._running
+
+    with mock.patch("agvisor.sandbox.subprocess.run", run):
+        asyncio.run(scenario())
+
+
 def test_skill_frontmatter_is_strict_yaml():
     # Claude Code and OpenCode forgive a bare `: ` inside a value; VS Code's strict YAML parser rejects the skill
     path = Path(__file__).parent.parent / ".claude/skills/agvisor/SKILL.md"
@@ -1370,5 +1459,6 @@ if __name__ == "__main__":
     test_mcp_python()
     test_mcp_put_dir()
     test_mcp_jobs()
+    test_async()
     test_skill_frontmatter_is_strict_yaml()
     print("ok")
