@@ -169,9 +169,10 @@ def test_snapshot_and_restore():
         sb = create_sandbox(name="proj")
         calls.clear()
         sb.snapshot("clean")
-        assert [c[1:3] for c in calls] == [["volume", "create"], ["volume", "inspect"], ["volume", "create"], ["run", "--rm"]]
+        assert [c[1:3] for c in calls] == [["volume", "create"], ["volume", "inspect"], ["volume", "create"],
+                                           ["pause", "agvisor-proj"], ["run", "--rm"], ["unpause", "agvisor-proj"]]  # frozen for the copy only
         assert calls[2][2:] == ["create", "--label=agvisor.snap=agvisor-proj", snap]  # delete() finds it by this label
-        cp = calls[-1]
+        cp = calls[4]
         assert "--network=none" in cp and "--runtime=runsc" in cp and f"--volume=agvisor-proj:/from:ro" in cp
         assert f"--volume={snap}:/to" in cp  # the source is read-only, only the copy is written
 
@@ -200,7 +201,28 @@ def test_snapshot_and_restore():
             pass
         else:
             raise AssertionError("swallowed a failed copy")
-    assert calls[-1][1:] == ["volume", "rm", "-f", snap]
+    assert calls[-2][1:] == ["volume", "rm", "-f", snap]
+    assert calls[-1][1:3] == ["unpause", "agvisor-proj"]  # and the sandbox is not left frozen
+
+    calls, run = fake_docker(fail=("pause",), inspect_out="false\n")  # stopped: nothing writes, copy without freezing
+    with mock.patch("agvisor.sandbox.subprocess.run", run):
+        Sandbox(name="proj").snapshot("clean")
+    assert not any(c[1] == "unpause" for c in calls) and any(c[1:3] == ["run", "--rm"] for c in calls)
+
+    calls, run = fake_docker(fail=("pause",), inspect_out="true\n")  # running but can't be frozen: no copy that may be torn
+    with mock.patch("agvisor.sandbox.subprocess.run", run):
+        try:
+            Sandbox(name="proj").snapshot("clean")
+        except RuntimeError as e:
+            assert "can't pause agvisor-proj" in str(e)
+        else:
+            raise AssertionError("copied a running sandbox it could not pause")
+    assert not any(c[1:3] == ["run", "--rm"] for c in calls) and calls[-1][1:] == ["volume", "rm", "-f", snap]
+
+    calls, run = fake_docker()  # idle_ttl: the marker is touched after unpausing, so the watchdog does not expire the sandbox
+    with mock.patch("agvisor.sandbox.subprocess.run", run):
+        Sandbox(name="proj", idle_ttl=60).snapshot("clean")
+    assert calls[-2][1:3] == ["unpause", "agvisor-proj"] and calls[-1][1:] == ["exec", "agvisor-proj", "touch", "/tmp/.agvisor_active"]
 
     calls, run = fake_docker(volume_owner="u42")  # another owner: refused before anything is copied or wiped
     with mock.patch("agvisor.sandbox.subprocess.run", run):

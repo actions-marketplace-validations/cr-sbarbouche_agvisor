@@ -116,7 +116,7 @@ with create_sandbox("python:3.12", name="my-project") as sb:
 
 - `snapshot(tag)` replaces a snapshot of the same tag; `restore(tag)` erases whatever is in the data dir now. `list_snapshots()` returns the tags, `delete_snapshot(tag)` frees one, and `delete()` removes them all with the sandbox. Tags: letters, digits, `_`, `-`.
 - Named sandboxes only, and the owner check applies. The copy runs in a throwaway gVisor container from the sandbox's image (it needs `sh`, `rm`, `cp`), with no network.
-- Each snapshot costs as much host disk as the data dir, and has no size cap either. Stop writing before `snapshot()`: a copy taken during writes can be inconsistent.
+- Each snapshot costs as much host disk as the data dir (so at most `workspace`, if you capped it). A running sandbox is paused while it is copied, so the snapshot is the data dir at one moment, not a mix of before and after a write: its processes stop for those few seconds, and an `exec()` meanwhile fails. An application that makes one change in several writes can still be caught between them.
 
 - **Kept:** everything under `sb.data_dir` (`/workspace`; the `gnome` home for `gui=True`), in a docker volume `agvisor-<name>`.
 - **Not kept:** processes, and anything outside `data_dir` (e.g. `apt install`): gVisor discards the rootfs overlay when the container is destroyed. Work in `/workspace` (venvs, repos, caches), or bake system packages into your image.
