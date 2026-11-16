@@ -48,7 +48,7 @@ with create_sandbox(image, host=host, egress=["pypi.org"], inject={"api.anthropi
     assert fetch(sb, "https://pypi.org/simple/six/").startswith("200")  # another host: a plain tunnel, the real certificate checks out
     r = fetch(sb, "http://api.anthropic.com/v1/models")  # a credential is not sent in the clear
     assert r.startswith("403") and "https" in r, r
-    assert fetch(sb, "https://example.org/").startswith("403")  # not on the list
+    assert "403" in fetch(sb, "https://example.org/")  # not on the list: the CONNECT is refused
     r = sb.exec("python3 -c \"import urllib.request as u; u.urlopen('https://api.anthropic.com/', timeout=20)\"", timeout=60)
     assert "CERTIFICATE_VERIFY_FAILED" not in r.stderr, r.stderr  # the sandbox trusts the egress CA
     r = sb.exec("env -u SSL_CERT_FILE python3 -c \"import ssl, urllib.request as u; "
