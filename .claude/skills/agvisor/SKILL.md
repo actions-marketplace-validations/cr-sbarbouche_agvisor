@@ -17,7 +17,7 @@ gVisor (`runsc`) sandboxes with CPU/memory/pids/disk limits, driven through the 
 - For data analysis or anything you explore step by step, use `python(code)`: variables and imports stay between calls, and the last expression is printed. It needs python3 in the image; if it says so, tell the user. `restart=True` clears it.
 - `run` stops at its `timeout` (and the sandbox's idle limit). For anything longer (a scan, a build, a server) use `start_job`, then `job_output(job_id, offset)` with the offset it returned, until it says `[exit N`. Poll at least every few minutes: a sandbox that nobody calls is deleted, running job included.
 - Going over memory or the process limit kills the whole sandbox, not one process. Expect "sandbox was reset".
-- With `snapshot`/`restore`: `/workspace` is kept across resets. Call `snapshot` before a risky install or rewrite, `restore` to undo it (one checkpoint; it erases the current `/workspace`).
+- With the snapshot tools: `/workspace` is kept across resets. Call `snapshot(tag)` before a risky install or rewrite, `restore(tag)` to undo it (it erases the current `/workspace`; the snapshot stays). `list_snapshots` shows the tags. Only a few can exist: `delete_snapshot(tag)` frees a slot.
 
 ## Without them: the Python library
 
