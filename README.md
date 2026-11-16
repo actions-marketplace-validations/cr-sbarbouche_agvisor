@@ -2,13 +2,13 @@
 
 [![PyPI Downloads](https://static.pepy.tech/personalized-badge/agvisor?period=total&units=INTERNATIONAL_SYSTEM&left_color=BLACK&right_color=GREEN&left_text=downloads)](https://pepy.tech/projects/agvisor)
 
-gVisor (`runsc`) sandboxes for coding agents. Thin wrapper over the `docker` CLI: CPU/memory/pids limits, optional GNOME desktop over RDP.
+gVisor (`runsc`) sandboxes for coding agents. Thin wrapper over the `docker` CLI: CPU/memory/pids/disk limits, named sandboxes with snapshots, an outbound allowlist that can also inject credentials, background jobs, files in and out, an asyncio interface, a warm pool, an MCP server, and an optional GNOME desktop over RDP.
 
 Two packages, versioned separately:
 
 | package | what | install |
 |---|---|---|
-| [`agvisor`](https://pypi.org/project/agvisor/) (PyPI) | the Python library: `create_sandbox(...)`, limits, `list_sandboxes` | `pip install agvisor` |
+| [`agvisor`](https://pypi.org/project/agvisor/) (PyPI) | the Python library: `create_sandbox(...)`, limits, `list_sandboxes`, `agvisor.aio`, `Pool` | `pip install agvisor` |
 | [`agvisor-desktop`](https://www.npmjs.com/package/agvisor-desktop) (npm) | the `<agvisor-desktop>` web component that shows a GUI sandbox in a web page ([details](#gui-in-a-web-page-react-nextjs-vue-plain-html)) | `npm install agvisor-desktop` |
 
 > **Alpha, and not security-audited.** Read [Security](#security) before running code you don't trust.
@@ -242,7 +242,7 @@ with Pool(2, "python:3.12-slim", network="none", lifetime=600) as pool:   # two 
 
 ### A browser inside
 
-Chromium runs under gVisor, so a page you didn't write can be opened, read and screenshotted without it touching your machine. Use [Playwright's image](https://mcr.microsoft.com/en-us/artifact/mar/playwright/python/about), which has the browsers, and install the matching Python package in the sandbox ([`examples/08_browser.py`](examples/08_browser.py)):
+Chromium runs under gVisor, so a page you didn't write can be opened, read and screenshotted without it touching your machine. Use [Playwright's image](https://mcr.microsoft.com/en-us/artifact/mar/playwright/python/about), which has the browsers, and install the matching Python package in the sandbox ([`examples/08_browser.py`](https://github.com/cr-sbarbouche/agvisor/blob/main/examples/08_browser.py)):
 
 ```python
 with create_sandbox("mcr.microsoft.com/playwright/python:v1.65.2-noble", network="isolated",
@@ -277,7 +277,7 @@ for sb in list_sandboxes(host="ssh://user@my-vm"):                 # every agvis
 
 ## Examples
 
-[`examples/`](examples/) has eight small, runnable scripts (quickstart, resuming and snapshots, limits, files and jobs, the egress allowlist, `network="isolated"`, the `/workspace` cap, a headless browser). CI runs all of them against real gVisor.
+[`examples/`](https://github.com/cr-sbarbouche/agvisor/tree/main/examples) has eight small, runnable scripts (quickstart, resuming and snapshots, limits, files and jobs, the egress allowlist, `network="isolated"`, the `/workspace` cap, a headless browser). CI runs all of them against real gVisor.
 
 ## Coding agents (skill + MCP server)
 
@@ -373,6 +373,7 @@ In `web/`: `npm test` checks the token round trip against the real gateway with 
 - **Sandboxes on one docker network can reach each other.** That is Docker's default: every sandbox on `"bridge"` (the default) or on a network you share between tenants can connect to the others' open ports. Use `network="isolated"` (one shared bridge with inter-container traffic off, tested in CI on real runsc), `network="none"`, or a separate network per tenant or run.
 - **`network="bridge"` also reaches the outside:** the internet, services listening on the host itself (through the bridge gateway), and on a cloud VM the metadata endpoint that serves instance credentials (see Host setup). Block what you don't want on the host's firewall, or use `network="none"`.
 - **`egress=` limits what a sandbox can connect to, not what it can say.** Allowed hosts can receive anything (data can ride in a URL to an allowed host), and an allowed name that an attacker controls the DNS of (a `*.` entry on a domain someone else can add subdomains to) can serve anything. On the one setup I tried (docker 29.1.3, runsc, WSL2) the sandbox couldn't resolve any name itself, so DNS is not a side channel there; other docker or gVisor versions are untested. The proxy container runs under `runc`, outside gVisor (see above). The proxy and the network are plain docker objects: whoever can run `docker` can read the proxy password and the allowlist.
+- **`inject=` puts a TLS-ending proxy in the path of the sandbox's requests.** The proxy parses TLS and HTTP bytes that the sandbox sends it, under docker's `runc` rather than gVisor (see `egress=`), and holds the private key of the certificate the sandbox is told to trust, for the injected hosts only: whoever takes over the proxy can impersonate those hosts to that one sandbox and read the credentials in its environment. The credentials are in the proxy container's environment, so whoever can run `docker inspect` on the host can read them. A sandbox can use a credential for anything its host accepts, and read it back if the service echoes request headers. Inject the narrowest credential the task needs.
 - **`gui=True` runs `--privileged`.** Under gVisor that only grants simulated capabilities; under plain `runc` it would be real, so agvisor refuses `runc` for GUI sandboxes. The RDP password is random per sandbox and the gateway token is encrypted and authenticated, but anyone holding a token can open a session until it expires.
 
 To report a vulnerability, email sadokbarbouche1@outlook.com instead of opening a public issue (details in `SECURITY.md`).
