@@ -26,6 +26,7 @@ Changelog = "https://github.com/cr-sbarbouche/agvisor/releases"
 
 [project.optional-dependencies]
 web = ["cryptography>=42"]  # only for Sandbox.desktop_token()
+inject = ["cryptography>=42"]  # only for create_sandbox(inject=): the sandbox's throwaway certificate authority
 mcp = ["mcp>=2"]  # only for the agvisor-mcp server; 2.x renamed FastMCP to MCPServer, so 1.x won't do
 
 [project.scripts]

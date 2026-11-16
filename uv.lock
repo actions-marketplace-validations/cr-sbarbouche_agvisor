@@ -1,5 +1,5 @@
 version = 1
-revision = 3
+revision = 5
 requires-python = ">=3.12"
 resolution-markers = [
     "python_full_version >= '3.14'",
@@ -12,6 +12,9 @@ version = "0.1.6"
 source = { editable = "." }
 
 [package.optional-dependencies]
+inject = [
+    { name = "cryptography" },
+]
 mcp = [
     { name = "mcp" },
 ]
@@ -21,10 +24,11 @@ web = [
 
 [package.metadata]
 requires-dist = [
+    { name = "cryptography", marker = "extra == 'inject'", specifier = ">=42" },
     { name = "cryptography", marker = "extra == 'web'", specifier = ">=42" },
     { name = "mcp", marker = "extra == 'mcp'", specifier = ">=2" },
 ]
-provides-extras = ["web", "mcp"]
+provides-extras = ["web", "inject", "mcp"]
 
 [[package]]
 name = "annotated-types"

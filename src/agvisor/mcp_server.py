@@ -5,15 +5,20 @@ AGVISOR_HOST (ssh://user@vm; default local docker / $DOCKER_HOST), AGVISOR_IMAGE
 AGVISOR_CPUS (2), AGVISOR_MEMORY (2g), AGVISOR_IDLE_TTL (600 s), AGVISOR_LIFETIME (3600 s).
 AGVISOR_EGRESS (unset): comma-separated hosts the sandbox may reach (create_sandbox(egress=)), e.g.
 "pypi.org,files.pythonhosted.org"; it replaces AGVISOR_NETWORK.
+AGVISOR_INJECT (unset): credentials the sandbox can use but never sees, JSON like
+{"api.example.com": {"Authorization": "Bearer sk-..."}} (create_sandbox(inject=); needs agvisor[inject]); those hosts are
+reachable, and it replaces AGVISOR_NETWORK like AGVISOR_EGRESS does.
 AGVISOR_NAME (unset) makes the sandbox a named one: /workspace is kept in a docker volume, and the snapshot tools
 (snapshot, restore, list_snapshots, delete_snapshot) exist. AGVISOR_SNAPSHOTS (3): how many snapshots may exist at once.
 AGVISOR_PUT_DIR (unset): HOST_DIR:/DEST, a directory of yours copied into the sandbox when it is made (put_dir), e.g.
 "/home/me/proj:/workspace/proj". Skipped when /DEST already exists, so a resumed named sandbox keeps its edits."""
 import atexit
+import json
 import os
 import shlex
 import threading
 
+from . import egress_proxy
 from .limits import Limits
 from .sandbox import Job, SandboxGone, create_sandbox
 
@@ -44,6 +49,17 @@ def _put():
     return host, dest
 
 
+def _inject():
+    """AGVISOR_INJECT as {host: {header: value}}, or None. The values are secrets: an error never repeats them."""
+    raw = _env("INJECT")
+    if not raw:
+        return None
+    try:
+        return egress_proxy.parse_inject(json.loads(raw))
+    except ValueError as e:  # a bad JSON text is one too
+        raise SystemExit(f'AGVISOR_INJECT must be JSON like {{"api.example.com": {{"Authorization": "Bearer ..."}}}}: {e}') from None
+
+
 def _snapshots():
     """AGVISOR_SNAPSHOTS as an int >= 1: every snapshot is a full copy of /workspace, so the agent gets a fixed number."""
     try:
@@ -60,9 +76,11 @@ def _get():
     with _lock:
         if _sb is None:
             egress = [e.strip() for e in (_env("EGRESS") or "").split(",") if e.strip()]
+            inject = _inject()
+            net = {**({"egress": egress} if egress else {}), **({"inject": inject} if inject else {})}
             sb = create_sandbox(
                 _env("IMAGE"), host=_env("HOST"), name=_env("NAME"),
-                **({"egress": egress} if egress else {"network": _env("NETWORK", "none")}),
+                **(net or {"network": _env("NETWORK", "none")}),
                 limits=Limits(cpus=float(_env("CPUS", 2)), memory=_env("MEMORY", "2g")),
                 idle_ttl=int(_env("IDLE_TTL", 600)), lifetime=int(_env("LIFETIME", 3600)))
             try:
@@ -265,8 +283,9 @@ def delete_snapshot(tag: str) -> str:
 
 
 def main():
-    _put()  # a bad AGVISOR_PUT_DIR or AGVISOR_SNAPSHOTS stops the server here
+    _put()  # a bad AGVISOR_PUT_DIR, AGVISOR_SNAPSHOTS or AGVISOR_INJECT stops the server here
     _snapshots()
+    _inject()
     try:
         from mcp.server.mcpserver import MCPServer  # mcp 2.x: v1's FastMCP was renamed
     except ImportError:
