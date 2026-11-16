@@ -169,9 +169,10 @@ def test_snapshot_and_restore():
         sb = create_sandbox(name="proj")
         calls.clear()
         sb.snapshot("clean")
-        assert [c[1:3] for c in calls] == [["volume", "create"], ["volume", "inspect"], ["volume", "create"], ["run", "--rm"]]
+        assert [c[1:3] for c in calls] == [["volume", "create"], ["volume", "inspect"], ["volume", "create"],
+                                           ["pause", "agvisor-proj"], ["run", "--rm"], ["unpause", "agvisor-proj"]]  # frozen for the copy only
         assert calls[2][2:] == ["create", "--label=agvisor.snap=agvisor-proj", snap]  # delete() finds it by this label
-        cp = calls[-1]
+        cp = calls[4]
         assert "--network=none" in cp and "--runtime=runsc" in cp and f"--volume=agvisor-proj:/from:ro" in cp
         assert f"--volume={snap}:/to" in cp  # the source is read-only, only the copy is written
 
@@ -200,7 +201,28 @@ def test_snapshot_and_restore():
             pass
         else:
             raise AssertionError("swallowed a failed copy")
-    assert calls[-1][1:] == ["volume", "rm", "-f", snap]
+    assert calls[-2][1:] == ["volume", "rm", "-f", snap]
+    assert calls[-1][1:3] == ["unpause", "agvisor-proj"]  # and the sandbox is not left frozen
+
+    calls, run = fake_docker(fail=("pause",), inspect_out="false\n")  # stopped: nothing writes, copy without freezing
+    with mock.patch("agvisor.sandbox.subprocess.run", run):
+        Sandbox(name="proj").snapshot("clean")
+    assert not any(c[1] == "unpause" for c in calls) and any(c[1:3] == ["run", "--rm"] for c in calls)
+
+    calls, run = fake_docker(fail=("pause",), inspect_out="true\n")  # running but can't be frozen: no copy that may be torn
+    with mock.patch("agvisor.sandbox.subprocess.run", run):
+        try:
+            Sandbox(name="proj").snapshot("clean")
+        except RuntimeError as e:
+            assert "can't pause agvisor-proj" in str(e)
+        else:
+            raise AssertionError("copied a running sandbox it could not pause")
+    assert not any(c[1:3] == ["run", "--rm"] for c in calls) and calls[-1][1:] == ["volume", "rm", "-f", snap]
+
+    calls, run = fake_docker()  # idle_ttl: the marker is touched after unpausing, so the watchdog does not expire the sandbox
+    with mock.patch("agvisor.sandbox.subprocess.run", run):
+        Sandbox(name="proj", idle_ttl=60).snapshot("clean")
+    assert calls[-2][1:3] == ["unpause", "agvisor-proj"] and calls[-1][1:] == ["exec", "agvisor-proj", "touch", "/tmp/.agvisor_active"]
 
     calls, run = fake_docker(volume_owner="u42")  # another owner: refused before anything is copied or wiped
     with mock.patch("agvisor.sandbox.subprocess.run", run):
@@ -1148,7 +1170,7 @@ def test_mcp_server():
         idle_ttl = 30
 
         def __init__(self, gone):
-            self.gone, self.calls, self.stopped = gone, [], False
+            self.gone, self.calls, self.stopped, self.snaps = gone, [], False, set()
 
         def exec(self, cmd, *, timeout, on_output):
             self.calls.append((cmd, timeout))
@@ -1160,10 +1182,22 @@ def test_mcp_server():
             self.stopped = True
 
         def snapshot(self, tag):
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,31}", tag):
+                raise ValueError(f"invalid snapshot tag {tag!r}")
             self.calls.append(("snapshot", tag))
+            self.snaps.add(tag)
 
         def restore(self, tag):
+            if tag not in self.snaps:
+                raise ValueError(f"no snapshot {tag!r} of agvisor-proj")
             self.calls.append(("restore", tag))
+
+        def list_snapshots(self):
+            return sorted(self.snaps)
+
+        def delete_snapshot(self, tag):
+            self.calls.append(("delete_snapshot", tag))
+            self.snaps.discard(tag)
 
     boxes, kws = [], []
 
@@ -1198,15 +1232,41 @@ def test_mcp_server():
         assert kws[0]["egress"] == ["pypi.org", "*.pythonhosted.org"] and "network" not in kws[0]
     m._sb = None
 
-    # AGVISOR_NAME: a named sandbox, whose /workspace the checkpoint tools save and roll back
+    # AGVISOR_NAME: a named sandbox, whose /workspace the snapshot tools save and roll back
     boxes.clear(), kws.clear()
     with mock.patch.object(m, "create_sandbox", create), mock.patch.dict(os.environ, {"AGVISOR_NAME": "proj"}):
-        assert m.snapshot() == "checkpoint saved" and kws[0]["name"] == "proj"
+        assert m.snapshot() == "snapshot checkpoint saved" and kws[0]["name"] == "proj"  # no tag: the old single slot
         assert "restarted" in m.restore()
-        assert boxes[0].calls == [("snapshot", "checkpoint"), ("restore", "checkpoint")]  # one fixed slot: no tag from the agent
+        assert boxes[0].calls == [("snapshot", "checkpoint"), ("restore", "checkpoint")]
+        assert m.list_snapshots() == "checkpoint"
+        assert m.snapshot("before-pip") == "snapshot before-pip saved" and m.list_snapshots() == "before-pip\ncheckpoint"
+        assert "restored /workspace to snapshot before-pip" in m.restore("before-pip")
+        assert m.snapshot("c") == "snapshot c saved"  # the third and last of the default 3
+        assert m.snapshot("d") == "already 3 snapshots (before-pip, c, checkpoint): delete_snapshot() one, or reuse one of these tags"
+        assert "d" not in boxes[0].snaps
+        m.delete_snapshot("c")
+        assert m.snapshot("checkpoint") == "snapshot checkpoint saved"  # an existing tag is replaced, not a new slot
+        assert m.delete_snapshot("checkpoint") == "snapshot checkpoint deleted" and m.list_snapshots() == "before-pip"
+        assert m.restore("nope") == "no snapshot 'nope' of agvisor-proj"  # said to the agent, not a traceback
+        assert m.snapshot("a b").startswith("invalid snapshot tag") and m.snapshot("../x").startswith("invalid snapshot tag")
+        m.delete_snapshot("before-pip")
+        assert m.list_snapshots() == "no snapshots"
         m._sb = None
         assert "Only /workspace is kept" in m.run("x")  # boxes[1] is the one that dies; its files are not all gone
     m._sb = None
+    boxes.clear(), kws.clear()
+    with mock.patch.object(m, "create_sandbox", create), mock.patch.dict(os.environ, {"AGVISOR_NAME": "proj", "AGVISOR_SNAPSHOTS": "1"}):
+        m.snapshot("a")
+        assert m.snapshot("b").startswith("already 1 snapshots (a)") and m.snapshot("a") == "snapshot a saved"
+    m._sb = None
+    for bad in ("0", "-1", "two", ""):  # checked when the server starts: "" falls back to the default
+        with mock.patch.dict(os.environ, {"AGVISOR_SNAPSHOTS": bad}):
+            try:
+                m._snapshots()
+            except SystemExit:
+                assert bad != ""
+            else:
+                assert bad == ""
 
 
 def test_mcp_write_file():
@@ -1437,6 +1497,95 @@ def test_mcp_put_dir():
             assert m._put() == (d, "/dest")
 
 
+def test_async():
+    import asyncio
+    import copy
+    import inspect
+    import time
+
+    from agvisor import aio
+
+    calls = []
+
+    def run(cmd, **_):  # a docker that takes 0.3 s per call
+        calls.append(cmd)
+        time.sleep(0.3)
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    async def scenario():
+        ticks = 0
+
+        async def ticker():  # the event loop must keep turning while docker is slow
+            nonlocal ticks
+            while True:
+                await asyncio.sleep(0.01)
+                ticks += 1
+
+        tick = asyncio.create_task(ticker())
+        async with aio.AsyncSandbox(limits=Limits(cpus=1)) as sb:
+            assert isinstance(sb, aio.AsyncSandbox) and sb.name.startswith("agvisor-") and sb._running  # attributes pass through
+            assert calls[-1][1] == "run" and "--cpus=1" in calls[-1]  # same arguments as Sandbox
+            t0, before = time.monotonic(), ticks
+            rs = await asyncio.gather(*(sb.exec("x") for _ in range(5)))
+            assert time.monotonic() - t0 < 1.0 and ticks - before > 10, "the calls ran one after the other, or blocked the loop"
+            assert [r.returncode for r in rs] == [0] * 5 and calls[-1][1:4] == ["exec", "-i", sb.name]
+
+            try:  # cancelling the wait: the loop is free again at once (the thread finishes by itself)
+                await asyncio.wait_for(sb.exec("slow"), 0.05)
+            except TimeoutError:
+                pass
+            else:
+                raise AssertionError("did not time out")
+            await asyncio.sleep(0.4)
+
+            threads = []
+            with mock.patch.object(Sandbox, "_stream", lambda self, *a, on_output: (on_output("a"), on_output("b"), subprocess.CompletedProcess(a, 0, "ab", ""))[2]):
+                got = []
+
+                async def on_async(text):
+                    got.append(text)
+                    threads.append(threading.current_thread() is threading.main_thread())
+
+                assert (await sb.exec("x", on_output=on_async)).stdout == "ab" and got == ["a", "b"]
+                got.clear()
+                await sb.exec("x", on_output=lambda text: (got.append(text), threads.append(threading.current_thread() is threading.main_thread())))
+                assert got == ["a", "b"]
+            assert threads == [True, True, False, False]  # an async callback runs on the loop, a plain one in the worker thread
+
+            seen = []
+            sb._obj.exec = lambda cmd, **kw: (seen.append(cmd), subprocess.CompletedProcess([], 0, "3\n", ""))[1]
+            job = await sb.spawn("x")  # a Job that is awaited, too
+            assert isinstance(job, aio.AsyncJob) and re.fullmatch(r"[0-9a-f]{12}", job.id)
+            assert await job.poll() == 3 and job.returncode == 3 and await job.wait() == 3
+            await job.kill()
+
+            def gone(cmd, **kw):
+                raise SandboxGone("agvisor-x is gone")
+
+            sb._obj.exec = gone
+            try:
+                await sb.put("/x", b"")
+            except SandboxGone:
+                pass
+            else:
+                raise AssertionError("an error in the thread must reach the caller")
+
+            assert not hasattr(sb, "nothing") and copy.copy(sb)._obj is sb._obj  # no endless __getattr__ on a bare copy
+            assert inspect.iscoroutinefunction(aio.AsyncSandbox.exec) and "timeout" in inspect.signature(aio.AsyncSandbox.exec).parameters
+        assert calls[-1][1:3] == ["rm", "-f"]  # `async with` stopped it
+        tick.cancel()
+
+        with mock.patch.object(aio, "_list_sandboxes", lambda host, owner: [Sandbox(name="a", owner=owner)]):
+            (one,) = await aio.list_sandboxes("ssh://u@vm", "me")
+            assert isinstance(one, aio.AsyncSandbox) and one.name == "agvisor-a" and one.owner == "me"
+        box = await aio.create_sandbox(host=None)
+        assert isinstance(box, aio.AsyncSandbox) and box._running
+        assert await box.stop() is None and not box._running
+
+    with mock.patch("agvisor.sandbox.subprocess.run", run):
+        asyncio.run(scenario())
+
+
 def test_skill_frontmatter_is_strict_yaml():
     # Claude Code and OpenCode forgive a bare `: ` inside a value; VS Code's strict YAML parser rejects the skill
     path = Path(__file__).parent.parent / ".claude/skills/agvisor/SKILL.md"
@@ -1486,5 +1635,6 @@ if __name__ == "__main__":
     test_mcp_python()
     test_mcp_put_dir()
     test_mcp_jobs()
+    test_async()
     test_skill_frontmatter_is_strict_yaml()
     print("ok")

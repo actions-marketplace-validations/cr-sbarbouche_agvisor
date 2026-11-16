@@ -116,7 +116,7 @@ with create_sandbox("python:3.12", name="my-project") as sb:
 
 - `snapshot(tag)` replaces a snapshot of the same tag; `restore(tag)` erases whatever is in the data dir now. `list_snapshots()` returns the tags, `delete_snapshot(tag)` frees one, and `delete()` removes them all with the sandbox. Tags: letters, digits, `_`, `-`.
 - Named sandboxes only, and the owner check applies. The copy runs in a throwaway gVisor container from the sandbox's image (it needs `sh`, `rm`, `cp`), with no network.
-- Each snapshot costs as much host disk as the data dir, and has no size cap either. Stop writing before `snapshot()`: a copy taken during writes can be inconsistent.
+- Each snapshot costs as much host disk as the data dir (so at most `workspace`, if you capped it). A running sandbox is paused while it is copied, so the snapshot is the data dir at one moment, not a mix of before and after a write: its processes stop for those few seconds, and an `exec()` meanwhile fails. An application that makes one change in several writes can still be caught between them.
 
 - **Kept:** everything under `sb.data_dir` (`/workspace`; the `gnome` home for `gui=True`), in a docker volume `agvisor-<name>`.
 - **Not kept:** processes, and anything outside `data_dir` (e.g. `apt install`): gVisor discards the rootfs overlay when the container is destroyed. Work in `/workspace` (venvs, repos, caches), or bake system packages into your image.
@@ -186,6 +186,26 @@ sb.python("rows[:3]", timeout=30, restart=False)                                
 
 Like notebook cells: variables, imports and functions survive between calls, and the value of a last expression is printed. `r` is a `CompletedProcess`: a Python exception is a traceback in `r.stdout`, not a return code. At `timeout` (default 60 s) the code gets a `TimeoutError` and the session survives; stuck where that can't reach it (a C call), the session is killed and `returncode` is 124. 127 means no `python3` in the image (`python:3.12-slim` has it). `max_bytes` (default 30 KB) cuts what comes back, inside the sandbox. The interpreter is a process in the container, so it goes with it: a new one starts (and says so) after a reset, `lifetime` or `idle_ttl`. Each call is one `exec()`, so `timeout + 5` must stay under `idle_ttl`. It is also an MCP tool, `python`. `tests/test_gvisor_mcp.py` runs it against real gVisor.
 
+### Async
+
+`agvisor.aio` has the same sandboxes for `asyncio` code: every blocking call runs in a worker thread, so the event loop stays free and calls can run side by side.
+
+```python
+import asyncio
+from agvisor import aio
+
+async def main():
+    async with aio.AsyncSandbox("python:3.12-slim", lifetime=600) as sb:
+        a, b = await asyncio.gather(sb.exec("sleep 2; echo a"), sb.exec("sleep 2; echo b"))   # ~2 s, not 4
+        job = await sb.spawn("echo building; sleep 1; echo done")
+        print(await job.wait(), (await job.read()).decode())
+
+asyncio.run(main())
+```
+
+- `AsyncSandbox(...)` takes `Sandbox`'s arguments; `await aio.create_sandbox(...)` starts it without `async with`, and `aio.list_sandboxes()` returns `AsyncSandbox` handles. Methods, results and errors are the same as the synchronous ones, awaited. Attributes (`name`, `data_dir`, ...) are read as usual.
+- Cancelling an await (`asyncio.wait_for`, a cancelled task) stops waiting, not the command: it runs on in the sandbox until its own `timeout=` ends it. Pass a `timeout`.
+- `exec(on_output=)` can be a plain function (called in a worker thread) or an `async def` (awaited on your loop).
 ### Warm pool
 
 `Pool` keeps sandboxes started and unused, so `acquire()` doesn't wait for `docker run` and what comes with it (the image check, and on a remote `host=ssh://...` the round trips of starting one): it costs one quick `exec`, a health check. Taking one starts a replacement in the background.
@@ -228,7 +248,7 @@ for sb in list_sandboxes(host="ssh://user@my-vm"):                 # every agvis
 Two optional pieces for Claude Code, VS Code (Copilot agent mode) and OpenCode:
 
 - **Skill**, [`.claude/skills/agvisor/SKILL.md`](https://github.com/cr-sbarbouche/agvisor/blob/main/.claude/skills/agvisor/SKILL.md): tells the agent when to sandbox, plus the gotchas above. Copy the `agvisor` folder to `.claude/skills/` (all three read it), or to `.github/skills/` / `.agents/skills/`.
-- **MCP server**, `agvisor-mcp`: `run(command, timeout)`, `write_file(path, content)`, `read_file(path)`, `edit_file(path, old, new)` (one exact, unique piece of text replaced), `list_files(path)`, `python(code, timeout, restart)` (a session that keeps variables between calls, like notebook cells: needs `python3` in `AGVISOR_IMAGE`; the interpreter is lost when the sandbox is reset), `start_job(command)`/`job_output(job_id, offset)`/`kill_job(job_id)` for what outlives `run()`, and `reset()` (plus `snapshot()`/`restore()`, opt-in, below), so the agent runs code in the sandbox, not on your host. It makes one sandbox on first use and keeps it until it has been idle for `AGVISOR_IDLE_TTL`. A skill only advises; to make the sandbox the *only* way the agent runs code, also turn off its host shell tool (if your client lets you).
+- **MCP server**, `agvisor-mcp`: `run(command, timeout)`, `write_file(path, content)`, `read_file(path)`, `edit_file(path, old, new)` (one exact, unique piece of text replaced), `list_files(path)`, `python(code, timeout, restart)` (a session that keeps variables between calls, like notebook cells: needs `python3` in `AGVISOR_IMAGE`; the interpreter is lost when the sandbox is reset), `start_job(command)`/`job_output(job_id, offset)`/`kill_job(job_id)` for what outlives `run()`, and `reset()` (plus the snapshot tools, opt-in, below), so the agent runs code in the sandbox, not on your host. It makes one sandbox on first use and keeps it until it has been idle for `AGVISOR_IDLE_TTL`. A skill only advises; to make the sandbox the *only* way the agent runs code, also turn off its host shell tool (if your client lets you).
 
 Settings are environment variables, so the agent can't pick its own image, network or limits:
 
@@ -241,11 +261,12 @@ Settings are environment variables, so the agent can't pick its own image, netwo
 | `AGVISOR_CPUS` / `AGVISOR_MEMORY` | `2` / `2g` |
 | `AGVISOR_IDLE_TTL` / `AGVISOR_LIFETIME` | `600` / `3600` seconds |
 | `AGVISOR_PUT_DIR` | unset. `HOST_DIR:/DEST`: a directory of yours copied into the sandbox when it is made (`put_dir`), e.g. `/home/me/proj:/workspace/proj`. Skipped when `/DEST` already exists, so a resumed named sandbox keeps its edits; an anonymous one gets the host's copy again after a reset. The whole directory goes through one tar in memory: keep it small (no `node_modules`, `.git`). Take results back with `agvisor get NAME /DEST ./out` |
-| `AGVISOR_NAME` | unset. Set it and `/workspace` is kept in a docker volume, and two more tools appear (below) |
+| `AGVISOR_NAME` | unset. Set it and `/workspace` is kept in a docker volume, and four more tools appear (below) |
+| `AGVISOR_SNAPSHOTS` | `3`. With `AGVISOR_NAME`: how many snapshots may exist at once |
 
 By default the sandbox is anonymous: no `/workspace` volume, so nothing is shared between projects, and the sandbox can't see your files (the agent writes code in with `write_file`).
 
-With `AGVISOR_NAME=my-project` the agent also gets `snapshot()` and `restore()`: one checkpoint of `/workspace` it can save and roll back to, e.g. before a risky `pip install`. `reset()` then keeps `/workspace` (use `restore()` to roll that back). Mind the cost: `/workspace` is a volume with no size cap, shared by every server process that uses that name, and the checkpoint is a second full copy of it. Claude Code:
+With `AGVISOR_NAME=my-project` the agent also gets `snapshot(tag)`, `restore(tag)`, `list_snapshots()` and `delete_snapshot(tag)`: copies of `/workspace` it can save and roll back to, e.g. before a risky `pip install` (no tag means `checkpoint`). `reset()` then keeps `/workspace` (use `restore()` to roll that back). Mind the cost: `/workspace` is a volume with no size cap, shared by every server process that uses that name, and each snapshot is a full copy of it, up to `AGVISOR_SNAPSHOTS` of them (a fourth is refused until the agent deletes one). Claude Code:
 
 ```sh
 claude mcp add agvisor -e AGVISOR_HOST=ssh://user@my-vm -- uvx --from 'agvisor[mcp]' agvisor-mcp
