@@ -562,19 +562,35 @@ class Sandbox:
                      "--user=0", "--entrypoint=sh", f"--volume={src}:/from:ro", f"--volume={dst}:/to", self.image,
                      "-c", "set -e; rm -rf /to/* /to/.[!.]* /to/..?*; cp -a /from/. /to/")
 
+    def _pause(self):
+        """Freeze the container, so that nothing writes to the volume while it is copied. False when it isn't running
+        (a stopped sandbox has no writers); a running one that can't be paused raises: no silent inconsistent copy."""
+        r = self._docker("pause", self.name, check=False)
+        if r.returncode and self._docker("inspect", "-f", "{{.State.Running}}", self.name, check=False).stdout.strip() == "true":
+            raise RuntimeError(f"can't pause {self.name} to copy its data: {r.stderr.strip()}")
+        return not r.returncode
+
     def snapshot(self, tag):
         """Save a copy of the data dir (/workspace) as `tag`, replacing a snapshot of that name. Named sandboxes only.
-        Kept until delete(). Costs as much disk as the data dir (so at most limits.workspace, if set; the snapshot
-        itself is not capped). Stop writing first: a copy taken
-        while something writes can be inconsistent."""
+        Kept until delete(). Costs as much disk as the data dir (so at most limits.workspace, if set). The running
+        container is paused while it is copied, so the copy is the data dir as it was at one moment, not a mix of
+        before and after a write. Its processes just stop for that time (a few seconds), and an exec() meanwhile fails;
+        an application that writes one logical change in several steps can still be caught between them."""
         snap = self._snap_volume(tag)
         self._claim_volume()  # also makes sure the volume exists: `docker run -v` would silently create an empty one
         self._docker("volume", "create", f"--label=agvisor.snap={self.name}", snap)
+        paused = False
         try:
+            paused = self._pause()
             self._copy(self.name, snap)
         except BaseException:
             self._docker("volume", "rm", "-f", snap, check=False)  # a half-copied snapshot must not be restorable
             raise
+        finally:
+            if paused:
+                self._docker("unpause", self.name, check=False)
+                if self.idle_ttl:  # the watchdog's clock kept running while its sleep was frozen: don't let that expire us
+                    self._docker("exec", self.name, "touch", _MARK, check=False)
 
     def list_snapshots(self):
         """Tags of this sandbox's snapshots, sorted. Named sandboxes only; the owner check applies."""

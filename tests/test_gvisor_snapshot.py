@@ -5,6 +5,7 @@
 AGVISOR_HOST unset -> docker on this machine. AGVISOR_IMAGE: any image already on that host (needs sh, rm, cp).
 """
 import os
+import time
 import uuid
 
 from agvisor import create_sandbox
@@ -32,6 +33,32 @@ try:
     sb.delete_snapshot("other")
     sb.delete_snapshot("other")  # already gone: fine
     assert sb.list_snapshots() == ["clean"]
+
+    # a writer that never stops: it rewrites 200 files with the next number, one pass after another. The data dir at one
+    # moment has every file at n or n-1; a copy taken while it runs would spread over the passes made meanwhile
+    sb.exec("mkdir -p w && cd w && for n in $(seq 200); do echo 0 > f$n; done")
+    job = sb.spawn("cd /workspace/w; i=0; while :; do i=$((i+1)); for f in f*; do echo $i > $f; done; done")
+    time.sleep(2)
+
+    def spread(tag):
+        sb.restore(tag)  # kills the writer too, and the numbers are read from the snapshot's files
+        nums = sorted(int(n) for n in sb.exec("cat w/f*").stdout.split())
+        return nums[0], nums[-1]
+
+    sb.snapshot("live")
+    sb.exec("true")  # the sandbox runs again: not left frozen
+    first = int(sb.exec("cat w/f1").stdout)
+    time.sleep(1)
+    assert int(sb.exec("cat w/f1").stdout) > first, "the writer did not run on after the snapshot"
+    low, high = spread("live")
+    assert low > 0 and high - low <= 1, (low, high)  # one moment
+
+    job = sb.spawn("cd /workspace/w; i=0; while :; do i=$((i+1)); for f in f*; do echo $i > $f; done; done")
+    time.sleep(2)
+    sb._pause = lambda: False  # the same copy, with the writer running
+    sb.snapshot("torn")
+    low, high = spread("torn")
+    print(f"copy of a running writer spans {high - low} passes (a paused one spans at most 1)")
 finally:
     sb.delete()  # volumes too, even when an assert failed
 print("ok")
