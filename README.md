@@ -206,6 +206,7 @@ asyncio.run(main())
 - `AsyncSandbox(...)` takes `Sandbox`'s arguments; `await aio.create_sandbox(...)` starts it without `async with`, and `aio.list_sandboxes()` returns `AsyncSandbox` handles. Methods, results and errors are the same as the synchronous ones, awaited. Attributes (`name`, `data_dir`, ...) are read as usual.
 - Cancelling an await (`asyncio.wait_for`, a cancelled task) stops waiting, not the command: it runs on in the sandbox until its own `timeout=` ends it. Pass a `timeout`.
 - `exec(on_output=)` can be a plain function (called in a worker thread) or an `async def` (awaited on your loop).
+
 ### Warm pool
 
 `Pool` keeps sandboxes started and unused, so `acquire()` doesn't wait for `docker run` and what comes with it (the image check, and on a remote `host=ssh://...` the round trips of starting one): it costs one quick `exec`, a health check. Taking one starts a replacement in the background.
