@@ -154,3 +154,7 @@ jobs:
             echo "::endgroup::"
           done
           exit $rc
+      - name: credential injection (the cryptography package comes with the inject extra)
+        env:
+          AGVISOR_IMAGE: python:3.12-slim
+        run: uv run --locked --extra inject python tests/test_inject_gvisor.py

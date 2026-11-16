@@ -7,19 +7,31 @@ Entry grammar, `host[:port]`: port defaults to 80 and 443, `*` = any port.
   example.com      exactly that name         *.example.com   its subdomains, not example.com itself
   1.2.3.4          an IPv4 address           10.0.0.0/24     an IPv4 network
 A name only gets through if it resolves to public addresses: a name is not a way to reach 10.x, the host or the cloud
-metadata endpoint. Reaching a private address takes an entry that says so (an IP or a network)."""
+metadata endpoint. Reaching a private address takes an entry that says so (an IP or a network).
+
+Credentials: for a host named in AGVISOR_INJECT, a CONNECT to port 443 is not a blind tunnel. The proxy ends the client's
+TLS with its own certificate (AGVISOR_TLS, which the client was told to trust), checks the request, sets the configured
+headers on it and sends it on over TLS of its own, with the real certificate of that host verified. So the client can
+use the credential and never holds it. One request per connection, like plain http. Plain http:// to such a host is refused.
+AGVISOR_INJECT: base64 of the JSON {host: {header: value}}; AGVISOR_TLS: base64 of a PEM certificate chain + private key."""
 import asyncio
 import base64
 import hmac
 import ipaddress
+import json
 import os
 import re
 import socket
+import ssl
+import tempfile
 from urllib.parse import urlsplit
 
 PORT = 3128
 _MAX = 256  # concurrent connections; the container's memory is the real limit
 _NAME = re.compile(r"(\*\.)?[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*")
+_HEADER = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
+_NOT_INJECTED = {"host", "content-length", "transfer-encoding", "connection", "keep-alive", "proxy-authorization",
+                 "proxy-connection", "upgrade", "te", "trailer"}  # these frame the request or the hop: not ours to set
 
 
 def parse_rules(entries):
@@ -40,6 +52,30 @@ def parse_rules(entries):
         else:
             raise ValueError(f"invalid egress entry {e!r}: expected host[:port], *.host[:port], an IPv4 address or network")
     return rules
+
+
+def parse_inject(inject):
+    """{host: {header: value}}, checked, with the hosts lowercased. Plain host names only (no wildcard, address or port): a
+    credential goes to exactly the host it was given for. A value never appears in an error message."""
+    if not isinstance(inject, dict) or not inject:
+        raise ValueError("inject must be a dict {host: {header: value}}")
+    out = {}
+    for host, headers in inject.items():
+        h = host.lower() if isinstance(host, str) else ""
+        if not _NAME.fullmatch(h) or h.startswith("*.") or re.fullmatch(r"[0-9.]+", h) or len(h) > 253 or h in out:
+            raise ValueError(f"invalid inject host {host!r}: a plain host name, listed once (no wildcard, address or port)")
+        if not isinstance(headers, dict) or not headers:
+            raise ValueError(f"inject[{host!r}] must be a dict {{header: value}}")
+        seen = out[h] = {}
+        for name, value in headers.items():
+            if not isinstance(name, str) or not _HEADER.fullmatch(name) or name.lower() in _NOT_INJECTED:
+                raise ValueError(f"invalid inject header name {name!r} for {host}")
+            if name.lower() in {n.lower() for n in seen}:
+                raise ValueError(f"inject header {name!r} for {host} is given twice")
+            if not isinstance(value, str) or any(c in value for c in "\r\n\0") or not value.isascii():
+                raise ValueError(f"inject header {name!r} for {host}: the value must be ASCII text on one line")
+            seen[name] = value
+    return out
 
 
 def match(rules, host, port):
@@ -98,13 +134,57 @@ async def _pipe(r, w):
             await w.drain()
         if w.can_write_eof():
             w.write_eof()  # the peer half-closed: pass it on, the answer may still be coming
+        else:
+            w.close()  # a TLS stream can't be half-closed: the request is over, or the answer is
     except OSError:
         w.close()
 
 
-async def serve(rules, token, host="0.0.0.0", port=PORT):
+async def _mitm(cr, cw, uw, host, creds, server_ctx, upstream_ctx):
+    """CONNECT to a host with credentials: end the client's TLS here, read its one request, and send it on over TLS of our
+    own with `creds` set. False (and the client told why) if the request isn't one to give a credential to."""
+    await cw.drain()  # the 200 must be out before the client starts its handshake
+    await asyncio.wait_for(cw.start_tls(server_ctx), 15)
+    await asyncio.wait_for(uw.start_tls(upstream_ctx, server_hostname=host), 15)  # verifies the certificate, and that it is `host`'s
+    head = await asyncio.wait_for(cr.readuntil(b"\r\n\r\n"), 15)
+    first, *lines = head[:-4].decode("latin-1").split("\r\n")
+    parts = first.split(" ")
+    hdr = [(l.partition(":")[0].strip().lower(), l.partition(":")[2].strip(), l) for l in lines]
+    hosts = [v.lower().removesuffix(":443").rstrip(".") for k, v, _ in hdr if k == "host"]
+    # origin-form only: an absolute URL in the request line could steer a shared front end to another site, with our credential
+    if len(parts) != 3 or not parts[1].startswith("/") or not parts[2].startswith("HTTP/1."):
+        await _reply(cw, 400, "Bad Request", "agvisor egress: not an HTTP/1.x request with a path")
+    elif any(l[:1] in " \t" or ":" not in l for l in lines):
+        await _reply(cw, 400, "Bad Request", "agvisor egress: header folding is not accepted on a host with credentials")
+    elif hosts != [host]:
+        await _reply(cw, 403, "Forbidden", f"agvisor egress: the Host header must be {host}")
+    else:
+        drop = {"connection", "keep-alive", "proxy-connection", "proxy-authorization"} | {n.lower() for n in creds}
+        uw.write((first + "\r\n" + "".join(l + "\r\n" for k, _, l in hdr if k not in drop)
+                  + "".join(f"{n}: {v}\r\n" for n, v in creds.items()) + "Connection: close\r\n\r\n").encode("latin-1"))
+        return True
+    return False
+
+
+def _server_ctx(pem):
+    ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+    ctx.minimum_version = ssl.TLSVersion.TLSv1_2
+    ctx.set_alpn_protocols(["http/1.1"])  # no h2: the request has to be readable here
+    with tempfile.NamedTemporaryFile("w", suffix=".pem") as f:  # the key touches only a tmpfs, and not for long
+        f.write(pem)
+        f.flush()
+        ctx.load_cert_chain(f.name)
+    return ctx
+
+
+async def serve(rules, token, host="0.0.0.0", port=PORT, inject=None, server_ctx=None, upstream_ctx=None):
+    """`inject`: parse_inject()'s result; then `server_ctx` (what the client's TLS ends in) and `upstream_ctx` (how the proxy
+    verifies the real host) are needed too."""
     want = b"Basic " + base64.b64encode(f"agvisor:{token}".encode())
     live = 0
+    inject = inject or {}
+    if inject and not (server_ctx and upstream_ctx):
+        raise ValueError("inject needs server_ctx and upstream_ctx")
 
     async def handle(cr, cw):
         nonlocal live
@@ -137,6 +217,8 @@ async def serve(rules, token, host="0.0.0.0", port=PORT):
             try:
                 if not kind:
                     raise _Denied(f"{host}:{port} is not in this sandbox's egress allowlist")
+                if path is not None and host in inject:  # a credential must not cross the network in the clear
+                    raise _Denied(f"{host} gets credentials injected, which happens over https only: use https://")
                 ur, uw = await _dial(host, port, kind)
             except _Denied as e:
                 print("deny", host, port, flush=True)
@@ -145,14 +227,18 @@ async def serve(rules, token, host="0.0.0.0", port=PORT):
                 print("fail", host, port, e, flush=True)
                 return await _reply(cw, 502, "Bad Gateway", f"agvisor egress: cannot connect to {host}:{port}: {e}")
             print("allow", host, port, flush=True)
-            if path is None:
-                cw.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
-            else:  # one request per connection: `Connection: close`, so a later request can't be sent anywhere else
-                drop = {"proxy-authorization", "proxy-connection", "connection", "keep-alive"}
-                uw.write(f"{method} {path} {version}\r\n".encode("latin-1")
-                         + "".join(f"{l}\r\n" for k, _, l in hdr if k not in drop).encode("latin-1") + b"Connection: close\r\n\r\n")
-            await asyncio.gather(_pipe(cr, uw), _pipe(ur, cw))  # ponytail: no idle timeout on a tunnel
-            uw.close()
+            try:
+                if path is None:
+                    cw.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
+                    if host in inject and port == 443 and not await _mitm(cr, cw, uw, host, inject[host], server_ctx, upstream_ctx):
+                        return
+                else:  # one request per connection: `Connection: close`, so a later request can't be sent anywhere else
+                    drop = {"proxy-authorization", "proxy-connection", "connection", "keep-alive"}
+                    uw.write(f"{method} {path} {version}\r\n".encode("latin-1")
+                             + "".join(f"{l}\r\n" for k, _, l in hdr if k not in drop).encode("latin-1") + b"Connection: close\r\n\r\n")
+                await asyncio.gather(_pipe(cr, uw), _pipe(ur, cw))  # ponytail: no idle timeout on a tunnel
+            finally:
+                uw.close()
         except (OSError, asyncio.IncompleteReadError, asyncio.LimitOverrunError):
             pass  # a client that vanished or sent junk
         finally:
@@ -163,7 +249,13 @@ async def serve(rules, token, host="0.0.0.0", port=PORT):
 
 
 async def main():
-    server = await serve(parse_rules(os.environ["AGVISOR_ALLOW"].split(",")), os.environ["AGVISOR_TOKEN"])
+    inject = server_ctx = upstream_ctx = None
+    if os.environ.get("AGVISOR_INJECT"):
+        inject = parse_inject(json.loads(base64.b64decode(os.environ["AGVISOR_INJECT"])))
+        server_ctx = _server_ctx(base64.b64decode(os.environ["AGVISOR_TLS"]).decode())
+        upstream_ctx = ssl.create_default_context()
+    server = await serve(parse_rules(os.environ["AGVISOR_ALLOW"].split(",")), os.environ["AGVISOR_TOKEN"],
+                         inject=inject, server_ctx=server_ctx, upstream_ctx=upstream_ctx)
     await server.serve_forever()
 
 

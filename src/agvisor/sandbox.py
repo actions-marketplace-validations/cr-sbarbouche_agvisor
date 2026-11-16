@@ -2,6 +2,7 @@ import base64
 import codecs
 import collections
 import io
+import json
 import math
 import os
 import re
@@ -14,7 +15,7 @@ import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import egress_proxy
+from . import _ca, egress_proxy
 from .desktop import GUI_HOME, GUI_IMAGE, GUI_USER, RDP_PORT, make_token
 from .limits import Limits
 
@@ -35,6 +36,21 @@ wait_for() { n=0; until "$@"; do n=$((n+1)); [ $n -le 120 ] || { echo "desktop n
 wait_for systemctl --user is-active --quiet $S
 systemctl --user restart $S
 wait_for grep -qE ':0D3D [0-9A-F:]+ 0A' /proc/net/tcp /proc/net/tcp6
+"""
+# inject=: the sandbox gets the egress CA's certificate, and a bundle of its own CAs plus that one, which the tools that
+# honour these variables use instead of their default. Run as root with the CA on stdin. No bundle in the image: fail.
+_CA_DIR = "/usr/local/share/agvisor"
+_TRUST = f"""set -e
+d={_CA_DIR}
+mkdir -p $d
+cat > $d/ca.pem
+for f in /etc/ssl/certs/ca-certificates.crt /etc/pki/tls/certs/ca-bundle.crt /etc/ssl/cert.pem; do
+  if [ -s $f ]; then cat $f > $d/bundle.pem; break; fi
+done
+[ -s $d/bundle.pem ] || {{ echo "no CA bundle in the image (looked in /etc/ssl/certs, /etc/pki/tls/certs)" >&2; exit 1; }}
+cat $d/ca.pem >> $d/bundle.pem
+chmod 755 $d
+chmod 644 $d/ca.pem $d/bundle.pem
 """
 _PROXY_IMAGE = "python:3.12-slim"  # egress=: runs egress_proxy.py; any image with python 3.12+ will do
 _PROXY_RUNTIME = "runc"  # not gVisor: there, docker's embedded DNS (127.0.0.11) doesn't work, and the proxy couldn't resolve names
@@ -134,7 +150,7 @@ class Sandbox:
     """host=None -> local docker; host="ssh://user@vm" -> docker on a remote VM/server."""
 
     def __init__(self, image=None, *, gui=False, limits=Limits(), network="bridge", lifetime=None,
-                 idle_ttl=None, name=None, owner=None, host=None, runtime="runsc", egress=None):
+                 idle_ttl=None, name=None, owner=None, host=None, runtime="runsc", egress=None, inject=None):
         self.gui, self.limits, self.network, self.lifetime, self.host = gui, limits, network, lifetime, host
         self.idle_ttl, self.runtime = idle_ttl, runtime
         # strict like `name`: it ends up in --runtime=. And never plain runc for a gui: it is run --privileged
@@ -154,6 +170,11 @@ class Sandbox:
             raise ValueError(f"invalid owner {owner!r}: letters, digits, '_', '.', '-' only (max 63)")
         if limits.workspace and name is None:  # an anonymous sandbox has no volume: a cap that caps nothing would mislead
             raise ValueError("limits.workspace caps the data volume of a named sandbox: pass name=")
+        if inject is not None:
+            if gui or network != "bridge":
+                raise ValueError("inject= goes through the egress proxy, which makes its own private network: headless only, and don't pass network=")
+            inject = egress_proxy.parse_inject(inject)
+            egress = [*(egress or []), *inject]  # a host you inject into is one the sandbox may reach
         if egress is not None:
             if gui or network != "bridge":
                 raise ValueError("egress= makes its own private network: headless only, and don't pass network=")
@@ -162,6 +183,7 @@ class Sandbox:
                 raise ValueError("egress is empty: that is network='none'")
             egress_proxy.parse_rules(egress)  # raises ValueError on an entry it can't use
         self.egress, self._has_egress = egress, egress is not None  # _has_egress: also true for handles from list_sandboxes()
+        self.inject, self._ca = inject, None  # _ca: the certificate the sandbox must trust, made by _egress_up()
         self.owner = owner
         self.created = None  # a datetime, set by list_sandboxes(); handles from create_sandbox() don't know it
         self.persistent = name is not None
@@ -278,15 +300,20 @@ class Sandbox:
         """egress=: a private network with no route out, and on it a proxy that only lets the allowlist through. The
         proxy is the one thing the sandbox can reach, and also on the default bridge. Returns the sandbox's env-file.
         The sandbox gets the proxy's IP: docker's embedded DNS (127.0.0.11) does not work under gVisor."""
+        pairs, tmpfs, b64 = [("AGVISOR_ALLOW", ",".join(self.egress))], [], lambda t: base64.b64encode(t.encode()).decode()
+        if self.inject:  # before anything is started: no cryptography package is an error with nothing to clean up
+            self._ca, proxy_pem = _ca.make(list(self.inject))
+            pairs += [("AGVISOR_INJECT", b64(json.dumps(self.inject))), ("AGVISOR_TLS", b64(proxy_pem))]  # one line each: env-file
+            tmpfs = ["--tmpfs=/tmp:rw,noexec,nosuid,size=1m,mode=1777"]  # where the proxy loads its key from: the root is read-only
         self._gc_egress()
         if self.persistent:  # leftovers of an earlier session of this name
             self._docker("rm", "-f", self._proxy, check=False)
             self._docker("network", "rm", self._net, check=False)
         token = secrets.token_urlsafe(18)  # the proxy password: any other container on the bridge can reach its port
-        env = "".join(f"{k}={v}\n" for k, v in [("AGVISOR_ALLOW", ",".join(self.egress)), ("AGVISOR_TOKEN", token)])
+        env = "".join(f"{k}={v}\n" for k, v in [*pairs, ("AGVISOR_TOKEN", token)])
         self._docker("run", "-d", f"--runtime={_PROXY_RUNTIME}", f"--name={self._proxy}", "--env-file=/dev/stdin",
                      "--user=65534:65534", "--memory=256m", "--memory-swap=256m", "--cpus=1", "--pids-limit=512",
-                     "--cap-drop=ALL", "--security-opt=no-new-privileges", "--read-only",
+                     "--cap-drop=ALL", "--security-opt=no-new-privileges", "--read-only", *tmpfs,
                      f"--label=agvisor.egress={self.name}",
                      _PROXY_IMAGE, "python", "-u", "-c", Path(egress_proxy.__file__).read_text(), input=env)
         self._docker("network", "create", "--internal", "--label=agvisor.egress=1", self._net)
@@ -294,8 +321,11 @@ class Sandbox:
         ip = self._docker("inspect", "-f", f'{{{{(index .NetworkSettings.Networks "{self._net}").IPAddress}}}}', self._proxy).stdout.strip()
         url = f"http://agvisor:{token}@{ip}:{egress_proxy.PORT}"
         skip = "localhost,127.0.0.1,::1"
+        trust = [(k, f"{_CA_DIR}/bundle.pem") for k in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "GIT_SSL_CAINFO")]
+        trust += [("NODE_EXTRA_CA_CERTS", f"{_CA_DIR}/ca.pem")]  # node adds this one to its own list
         return "".join(f"{k}={v}\n" for k, v in [("HTTP_PROXY", url), ("HTTPS_PROXY", url), ("http_proxy", url),
-                                                 ("https_proxy", url), ("NO_PROXY", skip), ("no_proxy", skip)])
+                                                 ("https_proxy", url), ("NO_PROXY", skip), ("no_proxy", skip),
+                                                 *(trust if self.inject else [])])
 
     def _gc_egress(self):
         """A sandbox that expires by itself (--rm) can't remove its proxy and network. So any egress start, and
@@ -357,6 +387,8 @@ class Sandbox:
         try:
             if self.network == "isolated" and not resumed:
                 self._isolated_dns()
+            if self._ca and not resumed:  # trusts the CA before anything can make a request
+                self._docker("exec", "-i", "-u", "root", self.name, "sh", "-c", _TRUST, input=self._ca)
             if self.gui:  # random host port + random password instead of the image's gnome:gnome
                 out = self._docker("port", self.name, f"{RDP_PORT}/tcp").stdout
                 self.rdp_port = int(out.splitlines()[0].rsplit(":", 1)[1])
@@ -668,6 +700,7 @@ def create_sandbox(
     host: str | None = None,
     runtime: str = "runsc",
     egress: list[str] | None = None,
+    inject: dict[str, dict[str, str]] | None = None,
 ) -> Sandbox:
     """Create and start a gVisor sandbox. Use `with create_sandbox(...) as sb:` or call sb.stop() yourself.
 
@@ -701,6 +734,14 @@ def create_sandbox(
               address or a network. A name must resolve to public addresses; reaching a private one takes an IP entry.
               The proxy runs python:3.12-slim (must be on the docker host) under docker's default runtime, runc: under
               gVisor docker's DNS doesn't work. Don't pass network=. Headless only; fixed at creation, like limits.
+    inject   Credentials the sandbox can use but never holds: {"api.example.com": {"Authorization": "Bearer sk-..."}}. The
+              egress proxy ends the sandbox's HTTPS to that host (a certificate authority made for this sandbox, which it
+              trusts, and whose key is dropped at once), sets those headers on every request, and sends it on over TLS of
+              its own with the host's real certificate verified. Replaces a header of the same name the sandbox sends. A plain
+              host name (no wildcard, address or port); it is also allowed through the proxy, and works for https:// on port
+              443 only (http:// to it is refused). One request per connection: no keep-alive, no websockets. Pip, curl,
+              requests, node and git trust the CA through the usual environment variables; other clients (java, a program
+              that pins certificates) do not. Needs pip install 'agvisor[inject]'. Same restrictions as egress=.
     runtime  The docker runtime, default "runsc". Name a second one (e.g. "runsc-gui", same runsc plus the GUI
               flags) to keep the strict one for headless sandboxes. Must be a gVisor runtime: plain runc is
               refused for gui, which runs --privileged.
@@ -714,4 +755,4 @@ def create_sandbox(
               "ssh://user@host" -> docker on a remote VM/server, e.g. an EC2 or Azure VM.
     """
     return Sandbox(image, gui=gui, limits=limits, network=network, lifetime=lifetime, idle_ttl=idle_ttl,
-                   name=name, owner=owner, host=host, runtime=runtime, egress=egress).start()
+                   name=name, owner=owner, host=host, runtime=runtime, egress=egress, inject=inject).start()

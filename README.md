@@ -145,8 +145,25 @@ The sandbox gets a private docker network (`--internal`: no route out) and the o
 - The proxy image is `python:3.12-slim` (a constant in `sandbox.py`): it has to be on the docker host or pullable. It needs a password because the default bridge can reach it: the password goes to docker on stdin, not on a command line, and is in the sandbox's environment (`HTTPS_PROXY`), where it is useless to anything that can't reach the proxy. `docker logs agvisor_proxy_<name>` shows one `allow` / `deny` line per connection.
 - A sandbox that expires (`lifetime`, `idle_ttl`) can't remove its proxy and network. The next `egress=` start does, and so do `agvisor prune` and `prune_egress()`: a proxy whose sandbox is gone is removed once it is 10 minutes old (its sandbox's image may still be downloading), then the networks nothing is attached to (those older than a minute). `stop()`, `delete()` and `agvisor rm` remove the proxy and network at once. Docker has ~30 default network address pools, so ~30 `egress=` sandboxes at once; widen `default-address-pools` in `daemon.json` for more.
 - Starting costs about six more docker calls: on `host="ssh://..."` that is noticeable (enable `ControlMaster`). Fixed at creation, like `limits`: re-attaching to a running named sandbox ignores `egress=`.
-- Not done: injecting credentials into requests (that needs intercepting TLS).
+- To give the sandbox a credential without handing it over, see [Credentials the sandbox can use but not read](#credentials-the-sandbox-can-use-but-not-read) below.
 - Checked on real gVisor (runsc 20261102.0, docker 29.1.3, WSL2): HTTPS and plain HTTP to listed hosts, a 403 that names the rule for the rest, no route around the proxy, no name resolution inside, `pip install` through it, and the cleanup above. `tests/test_gvisor_egress.py` runs that against a docker host.
+
+#### Credentials the sandbox can use but not read
+
+```python
+sb = create_sandbox("python:3.12-slim", inject={"api.example.com": {"Authorization": "Bearer sk-..."}})
+sb.exec("curl https://api.example.com/v1/me")   # the request carries the header; the sandbox never held the key
+```
+
+`inject={host: {header: value}}` (needs `pip install 'agvisor[inject]'`) builds on `egress=`: the proxy ends the sandbox's HTTPS to that host, sets the headers on every request (replacing one of the same name that the sandbox sent), and sends it on over TLS of its own, with the host's real certificate verified. The host is allowed through the proxy by being named; `egress=` can add others (plain tunnels, as before).
+
+- The sandbox trusts a certificate authority made for it on your machine. Its private key is dropped as soon as it has signed the one certificate the proxy needs (for the injected hosts), so nothing else can ever be signed with it. The proxy gets that certificate and its key through docker's stdin, and loads it from a tmpfs. The authority is valid for 30 days: make the sandbox again after that.
+- The credential stays out of the sandbox: not in its environment, its files or its command lines. It sits in the proxy container's environment, so whoever can run `docker inspect` on the host can read it, as with any secret passed to a container. A sandbox can still *use* it, for whatever that host allows, and if the service echoes its headers back, it can read it that way.
+- Plain host names only, no wildcards, addresses or ports. `https://` on port 443 only: `http://` to such a host is refused, not sent in the clear. Other ports of the same host are plain tunnels, with no injection.
+- Before a request gets a credential, the proxy checks that it has a path (no absolute URL in the request line, which could steer a shared front end to another site), a single `Host` header naming the injected host, and no folded headers. A server whose certificate does not verify as that host never sees the credential.
+- One request per connection (`Connection: close`, as for plain `http://` already), and no HTTP/2 or websockets to those hosts: clients fall back to HTTP/1.1 and reconnect. The sandbox's `SSL_CERT_FILE`, `REQUESTS_CA_BUNDLE`, `CURL_CA_BUNDLE` and `GIT_SSL_CAINFO` point at its own certificates plus the authority, and `NODE_EXTRA_CA_CERTS` at the authority: Python, `requests`, `curl`, `git`, Go and Node trust it. Java, and programs that pin certificates, do not. The image needs a CA bundle at `/etc/ssl/certs/ca-certificates.crt` or `/etc/pki/tls/certs/ca-bundle.crt`: without one, `create_sandbox` raises.
+- `AGVISOR_INJECT` sets it for the MCP server (below), so the agent has the credential's use and not its value.
+- `tests/test_args.py` runs the proxy end to end against fake servers (the credential is set, replaced, withheld from a server that doesn't verify, refused over http); `tests/test_inject_gvisor.py` runs it on real gVisor.
 
 ### Files in and out
 
@@ -258,6 +275,7 @@ Settings are environment variables, so the agent can't pick its own image, netwo
 | `AGVISOR_HOST` | local docker / `$DOCKER_HOST`; `ssh://user@vm` for a remote Linux host |
 | `AGVISOR_NETWORK` | `none` (no internet: `pip install` fails). `bridge` for internet |
 | `AGVISOR_EGRESS` | unset. Comma-separated hosts the sandbox may reach, e.g. `pypi.org,files.pythonhosted.org`: [`egress=`](#limiting-outbound-traffic), instead of `AGVISOR_NETWORK` |
+| `AGVISOR_INJECT` | unset. Credentials the sandbox can use but not read, as JSON: `{"api.example.com": {"Authorization": "Bearer sk-..."}}` ([`inject=`](#credentials-the-sandbox-can-use-but-not-read), needs `agvisor[inject]`). Those hosts are reachable; it replaces `AGVISOR_NETWORK` like `AGVISOR_EGRESS`, and can be combined with it |
 | `AGVISOR_IMAGE` | `ubuntu:24.04` |
 | `AGVISOR_CPUS` / `AGVISOR_MEMORY` | `2` / `2g` |
 | `AGVISOR_IDLE_TTL` / `AGVISOR_LIFETIME` | `600` / `3600` seconds |

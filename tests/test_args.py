@@ -1,11 +1,13 @@
 import base64
 import contextlib
 import io
+import json
 import os
 import re
 import shlex
 import shutil
 import subprocess
+import tempfile
 import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -670,6 +672,220 @@ def test_egress_args():
         assert [c[0][0] for c in calls[-2:]] == ["rm", "network"] and calls[-1][0][1] == "rm"
 
 
+def test_inject_args():
+    secret = "Bearer sk-SECRET"
+    for bad in ({"inject": {}}, {"inject": {"*.x.com": {"A": "b"}}}, {"inject": {"1.2.3.4": {"A": "b"}}}, {"inject": {"x.com:443": {"A": "b"}}},
+                {"inject": {"x.com": {}}}, {"inject": {"x.com": {"Host": "evil"}}}, {"inject": {"x.com": {"Content-Length": "0"}}},
+                {"inject": {"x.com": {"A B": "c"}}}, {"inject": {"x.com": {"A": f"{secret}\r\nX-Evil: 1"}}},
+                {"inject": {"x.com": {"A": f"{secret}\n"}}}, {"inject": {"x.com": {"A": "caf\u00e9"}}}, {"inject": {"x.com": {"A": 1}}},
+                {"inject": {"x.com": {"A": "1", "a": "2"}}}, {"inject": {"x.com": {"A": "1"}, "X.com": {"A": "2"}}},
+                {"inject": {"x.com": {"A": "b"}}, "network": "none"}, {"inject": {"x.com": {"A": "b"}}, "gui": True}, {"inject": ["x.com"]}):
+        try:
+            Sandbox(**bad)
+        except ValueError as e:
+            assert secret not in str(e) and "sk-SECRET" not in str(e)  # a value never ends up in an error
+            continue
+        raise AssertionError(f"accepted {bad}")
+    sb = Sandbox(inject={"API.x.com": {"Authorization": secret}}, egress=["pypi.org"])
+    assert sb.inject == {"api.x.com": {"Authorization": secret}} and sb.egress == ["pypi.org", "api.x.com"]  # the host is allowed too
+    assert Sandbox(inject={"x.com": {"A": "b"}}).egress == ["x.com"]  # inject= alone is enough
+
+    calls = []
+
+    def run(cmd, input=None, **_):
+        calls.append((cmd[1:], input))
+        return subprocess.CompletedProcess(cmd, 0, "172.18.0.2\n" if cmd[1] == "inspect" else "", "")
+
+    with mock.patch("agvisor.sandbox.subprocess.run", run), mock.patch("agvisor.sandbox._ca.make", lambda hosts: ("CA-PEM", f"LEAF+KEY for {hosts}")):
+        create_sandbox(inject={"api.x.com": {"Authorization": secret}}, egress=["pypi.org"])
+    proxy = next(c for c in calls if c[0][0] == "run" and any("proxy" in a for a in c[0]))
+    box = [c for c in calls if c[0][0] == "run"][-1]
+    assert "--tmpfs=/tmp:rw,noexec,nosuid,size=1m,mode=1777" in proxy[0] and "--read-only" in proxy[0]  # where it loads its key
+    penv = dict(l.split("=", 1) for l in proxy[1].split())
+    assert json.loads(base64.b64decode(penv["AGVISOR_INJECT"])) == {"api.x.com": {"Authorization": secret}}
+    assert base64.b64decode(penv["AGVISOR_TLS"]) == b"LEAF+KEY for ['api.x.com']" and penv["AGVISOR_ALLOW"] == "pypi.org,api.x.com"
+    benv = dict(l.split("=", 1) for l in box[1].split())
+    assert benv["SSL_CERT_FILE"] == benv["REQUESTS_CA_BUNDLE"] == benv["CURL_CA_BUNDLE"] == benv["GIT_SSL_CAINFO"] == "/usr/local/share/agvisor/bundle.pem"
+    assert benv["NODE_EXTRA_CA_CERTS"] == "/usr/local/share/agvisor/ca.pem"
+    assert secret not in box[1] and "AGVISOR_INJECT" not in box[1] and "AGVISOR_TLS" not in box[1]  # the sandbox never gets the credential
+    assert not any(secret in str(c[0]) or penv["AGVISOR_TLS"] in str(c[0]) or penv["AGVISOR_INJECT"] in str(c[0]) for c in calls)  # stdin only: a command line shows up in `ps`
+    trust = next(i for i, c in enumerate(calls) if c[1] == "CA-PEM")  # the CA is on stdin, of an exec as root in the sandbox
+    assert calls[trust][0][:4] == ["exec", "-i", "-u", "root"] and trust > calls.index(box) and "cat > $d/ca.pem" in calls[trust][0][-1]
+    assert [c for c in calls if c[0][0] == "run" and "ubuntu:24.04" in c[0] and "--env-file=/dev/stdin" not in c[0]] == []
+
+    calls.clear()  # no inject: no CA, no trust step, no tmpfs
+    with mock.patch("agvisor.sandbox.subprocess.run", run), mock.patch("agvisor.sandbox._ca.make", lambda hosts: 1 / 0):
+        create_sandbox(egress=["pypi.org"])
+    assert not any("--tmpfs=/tmp:rw,noexec,nosuid,size=1m,mode=1777" in c[0] or c[0][0] == "exec" for c in calls)
+
+    calls.clear()  # no cryptography package: an error before anything is started
+    with mock.patch("agvisor.sandbox.subprocess.run", run), mock.patch("agvisor.sandbox._ca.make", mock.Mock(side_effect=RuntimeError("inject= needs the cryptography package"))):
+        try:
+            create_sandbox(inject={"x.com": {"A": "b"}})
+        except RuntimeError as e:
+            assert "cryptography" in str(e)
+        else:
+            raise AssertionError("started without a CA")
+    assert not any(c[0][0] == "run" for c in calls)
+
+    calls.clear()  # the trust step fails (an image with no CA bundle): the sandbox, its proxy and network are removed
+    def run_fail(cmd, input=None, **_):
+        r = run(cmd, input=input)
+        return subprocess.CompletedProcess(cmd, 1 if cmd[1] == "exec" and "root" in cmd else 0, r.stdout, "no CA bundle in the image")
+    with mock.patch("agvisor.sandbox.subprocess.run", run_fail), mock.patch("agvisor.sandbox._ca.make", lambda hosts: ("CA-PEM", "X")):
+        try:
+            create_sandbox(inject={"x.com": {"A": "b"}})
+        except RuntimeError as e:
+            assert "no CA bundle" in str(e)
+        else:
+            raise AssertionError("an untrusted CA was ignored")
+    assert [c[0][:2] for c in calls[-3:]] == [["rm", "-f"], ["rm", "-f"], ["network", "rm"]]
+
+
+def test_egress_inject():
+    """The proxy, end to end on this machine: a client that trusts the egress CA, a fake upstream with a certificate of its own."""
+    import asyncio
+    import ssl
+
+    try:
+        from agvisor import _ca
+        _ca.make(["x.test"])
+    except RuntimeError:
+        print("test_egress_inject skipped: no cryptography package")
+        return
+    from agvisor import egress_proxy as ep
+
+    ca_pem, leaf_pem = _ca.make(["api.test", "evil.test"])  # what the sandbox trusts, what the proxy ends TLS with
+    up_ca, up_leaf = _ca.make(["api.test"])  # the real api.test, with its own CA that the proxy verifies against
+    bad_ca, bad_leaf = _ca.make(["evil.test"])  # a server that is not api.test's: must never see the credential
+
+    def server_ctx(pem):
+        ctx = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        with tempfile.NamedTemporaryFile("w", suffix=".pem") as f:
+            f.write(pem)
+            f.flush()
+            ctx.load_cert_chain(f.name)
+        return ctx
+
+    seen = {"api": [], "evil": [], "plain": []}
+
+    def upstream(name):
+        async def handle(r, w):
+            try:
+                if name == "plain":  # not TLS: an echo
+                    data = await r.read(100)
+                    seen[name].append(data)
+                    w.write(data)
+                else:
+                    head = await asyncio.wait_for(r.readuntil(b"\r\n\r\n"), 5)
+                    seen[name].append(head)
+                    w.write(b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\n\r\nok")
+                await w.drain()
+            except (OSError, asyncio.IncompleteReadError, asyncio.TimeoutError, ssl.SSLError):
+                pass
+            finally:
+                w.close()
+        return handle
+
+    async def scenario():
+        ports = {}
+        for name, ctx in (("api", server_ctx(up_leaf)), ("evil", server_ctx(bad_leaf)), ("plain", None)):
+            srv = await asyncio.start_server(upstream(name), "127.0.0.1", 0, ssl=ctx)
+            ports[name] = srv.sockets[0].getsockname()[1]
+
+        async def dial(host, port, kind):  # whatever the name, connect to our fakes
+            return await asyncio.open_connection("127.0.0.1", ports[{"api.test": "api", "evil.test": "evil"}.get(host, "plain")])
+
+        up_ctx = ssl.create_default_context(cadata=up_ca)  # the proxy trusts the real api.test's CA only
+        with mock.patch.object(ep, "_dial", dial):
+            proxy = await ep.serve(ep.parse_rules(["api.test", "evil.test", "other.test"]), "pw", "127.0.0.1", 0,
+                                   inject=ep.parse_inject({"api.test": {"Authorization": "Bearer REAL"}, "evil.test": {"Authorization": "Bearer REAL"}}),
+                                   server_ctx=ep._server_ctx(leaf_pem), upstream_ctx=up_ctx)
+            pport = proxy.sockets[0].getsockname()[1]
+
+            async def connect(host, port=443, auth="pw"):
+                r, w = await asyncio.open_connection("127.0.0.1", pport)
+                w.write(f"CONNECT {host}:{port} HTTP/1.1\r\nProxy-Authorization: Basic {base64.b64encode(f'agvisor:{auth}'.encode()).decode()}\r\n\r\n".encode())
+                status = (await asyncio.wait_for(r.readline(), 5)).decode()
+                while await asyncio.wait_for(r.readline(), 5) not in (b"\r\n", b""):  # the rest of the answer's head
+                    pass
+                return r, w, status
+
+            async def https(host, request, ca=ca_pem):
+                r, w, status = await connect(host)
+                assert " 200 " in status, status
+                await w.start_tls(ssl.create_default_context(cadata=ca), server_hostname=host)
+                w.write(request)
+                reply = await asyncio.wait_for(r.read(), 5)  # to the end: `Connection: close`
+                w.close()
+                return reply
+
+            ok = b"HTTP/1.1 200 OK"
+            reply = await https("api.test", b"GET /v1/x HTTP/1.1\r\nHost: api.test\r\nAuthorization: Bearer DUMMY\r\nauthorization: second\r\nAccept: */*\r\nConnection: keep-alive\r\n\r\n")
+            assert reply.startswith(ok) and reply.endswith(b"ok")
+            head = seen["api"].pop()
+            lines = head.decode().split("\r\n")
+            assert lines[0] == "GET /v1/x HTTP/1.1" and "Authorization: Bearer REAL" in lines  # set
+            assert sum(l.lower().startswith("authorization:") for l in lines) == 1 and "DUMMY" not in head.decode()  # replaced, not added
+            assert "Accept: */*" in lines and "Host: api.test" in lines and lines.count("Connection: close") == 1 and "Connection: keep-alive" not in lines
+
+            reply = await https("api.test", b"POST /y HTTP/1.1\r\nHost: API.test:443\r\nContent-Length: 3\r\n\r\nabc")  # none sent: added
+            assert reply.startswith(ok) and b"Authorization: Bearer REAL\r\n" in seen["api"].pop()
+
+            for request, code in ((b"GET /x HTTP/1.1\r\nHost: evil.test\r\n\r\n", b" 403 "),  # another site on the same front end
+                                  (b"GET /x HTTP/1.1\r\n\r\n", b" 403 "), (b"GET /x HTTP/1.1\r\nHost: api.test\r\nHost: api.test\r\n\r\n", b" 403 "),
+                                  (b"GET http://evil.test/x HTTP/1.1\r\nHost: api.test\r\n\r\n", b" 400 "),  # absolute-form
+                                  (b"GET /x HTTP/1.1\r\nHost: api.test\r\nX: a\r\n b\r\n\r\n", b" 400 "),  # header folding
+                                  (b"GET /x HTTP/1.1\r\nHost: api.test\r\nnot a header\r\n\r\n", b" 400 ")):
+                assert code in (await https("api.test", request)).split(b"\r\n")[0], request
+            assert not seen["api"], "a refused request reached the upstream"
+
+            r, w, status = await connect("api.test")  # a client that does not trust the egress CA: no request is made at all
+            try:
+                await w.start_tls(ssl.create_default_context(), server_hostname="api.test")
+            except ssl.SSLCertVerificationError:
+                pass
+            else:
+                raise AssertionError("verified a certificate it should not trust")
+            assert not seen["api"]
+
+            # a host whose certificate is not the real api.test's (here: evil.test's server, reached for a host with credentials)
+            try:
+                await https("evil.test", b"GET / HTTP/1.1\r\nHost: evil.test\r\n\r\n")
+            except (ssl.SSLError, ConnectionError, asyncio.IncompleteReadError):
+                pass
+            assert not seen["evil"], "the credential went to a server whose certificate was not verified"
+
+            # plain http to a host with credentials is refused, not sent in the clear
+            r, w = await asyncio.open_connection("127.0.0.1", pport)
+            w.write(f"GET http://api.test/x HTTP/1.1\r\nHost: api.test\r\nProxy-Authorization: Basic {base64.b64encode(b'agvisor:pw').decode()}\r\n\r\n".encode())
+            reply = await asyncio.wait_for(r.read(), 5)
+            assert b" 403 " in reply.split(b"\r\n")[0] and b"https" in reply and not seen["api"]
+            w.close()
+
+            # a host without credentials, and api.test on another port: blind tunnels as before
+            r, w, status = await connect("other.test")
+            assert " 200 " in status
+            w.write(b"ping")
+            assert await asyncio.wait_for(r.read(4), 5) == b"ping" and seen["plain"] == [b"ping"]
+            w.close()
+            r, w, status = await connect("other.test", auth="wrong")
+            assert " 407 " in status
+            w.close()
+        proxy.close()
+
+    with contextlib.redirect_stdout(io.StringIO()):  # the proxy logs every connection
+        asyncio.run(scenario())
+
+    # injection needs both contexts; the real main() builds them from the environment
+    try:
+        asyncio.run(ep.serve([], "t", inject=ep.parse_inject({"x.com": {"A": "b"}})))
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("served credentials without TLS")
+
+
 def test_egress_proxy():
     import asyncio
     import base64
@@ -1232,6 +1448,27 @@ def test_mcp_server():
         assert kws[0]["egress"] == ["pypi.org", "*.pythonhosted.org"] and "network" not in kws[0]
     m._sb = None
 
+    # AGVISOR_INJECT: credentials for the sandbox's proxy, which replace the network setting; they are the user's, not the agent's
+    boxes.clear(), kws.clear()
+    creds = {"api.x.com": {"Authorization": "Bearer sk-SECRET"}}
+    with mock.patch.object(m, "create_sandbox", create), mock.patch.dict(os.environ, {"AGVISOR_INJECT": json.dumps(creds), "AGVISOR_NETWORK": "bridge"}):
+        m.run("x")
+        assert kws[0]["inject"] == creds and "egress" not in kws[0] and "network" not in kws[0]
+    m._sb = None
+    boxes.clear(), kws.clear()
+    with mock.patch.object(m, "create_sandbox", create), mock.patch.dict(os.environ, {"AGVISOR_INJECT": json.dumps(creds), "AGVISOR_EGRESS": "pypi.org"}):
+        m.run("x")
+        assert kws[0]["inject"] == creds and kws[0]["egress"] == ["pypi.org"]  # both
+    m._sb = None
+    for bad in ("not json", "[]", '{"*.x.com": {"A": "b"}}', '{"x.com": {"Host": "SECRET-VALUE"}}', '{"x.com": {"A": "SECRET-VALUE\\n"}}'):
+        with mock.patch.dict(os.environ, {"AGVISOR_INJECT": bad}):
+            try:
+                m._inject()
+            except SystemExit as e:
+                assert "SECRET-VALUE" not in str(e)  # a value is never repeated
+            else:
+                raise AssertionError(f"accepted AGVISOR_INJECT={bad}")
+
     # AGVISOR_NAME: a named sandbox, whose /workspace the snapshot tools save and roll back
     boxes.clear(), kws.clear()
     with mock.patch.object(m, "create_sandbox", create), mock.patch.dict(os.environ, {"AGVISOR_NAME": "proj"}):
@@ -1623,6 +1860,8 @@ if __name__ == "__main__":
     test_exec_streams_output()
     test_put_and_get()
     test_egress_args()
+    test_inject_args()
+    test_egress_inject()
     test_egress_proxy()
     test_jobs()
     test_pool()
