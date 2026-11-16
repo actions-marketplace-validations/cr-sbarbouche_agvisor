@@ -1033,7 +1033,7 @@ def test_mcp_server():
         idle_ttl = 30
 
         def __init__(self, gone):
-            self.gone, self.calls, self.stopped = gone, [], False
+            self.gone, self.calls, self.stopped, self.snaps = gone, [], False, set()
 
         def exec(self, cmd, *, timeout, on_output):
             self.calls.append((cmd, timeout))
@@ -1045,10 +1045,22 @@ def test_mcp_server():
             self.stopped = True
 
         def snapshot(self, tag):
+            if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,31}", tag):
+                raise ValueError(f"invalid snapshot tag {tag!r}")
             self.calls.append(("snapshot", tag))
+            self.snaps.add(tag)
 
         def restore(self, tag):
+            if tag not in self.snaps:
+                raise ValueError(f"no snapshot {tag!r} of agvisor-proj")
             self.calls.append(("restore", tag))
+
+        def list_snapshots(self):
+            return sorted(self.snaps)
+
+        def delete_snapshot(self, tag):
+            self.calls.append(("delete_snapshot", tag))
+            self.snaps.discard(tag)
 
     boxes, kws = [], []
 
@@ -1083,15 +1095,41 @@ def test_mcp_server():
         assert kws[0]["egress"] == ["pypi.org", "*.pythonhosted.org"] and "network" not in kws[0]
     m._sb = None
 
-    # AGVISOR_NAME: a named sandbox, whose /workspace the checkpoint tools save and roll back
+    # AGVISOR_NAME: a named sandbox, whose /workspace the snapshot tools save and roll back
     boxes.clear(), kws.clear()
     with mock.patch.object(m, "create_sandbox", create), mock.patch.dict(os.environ, {"AGVISOR_NAME": "proj"}):
-        assert m.snapshot() == "checkpoint saved" and kws[0]["name"] == "proj"
+        assert m.snapshot() == "snapshot checkpoint saved" and kws[0]["name"] == "proj"  # no tag: the old single slot
         assert "restarted" in m.restore()
-        assert boxes[0].calls == [("snapshot", "checkpoint"), ("restore", "checkpoint")]  # one fixed slot: no tag from the agent
+        assert boxes[0].calls == [("snapshot", "checkpoint"), ("restore", "checkpoint")]
+        assert m.list_snapshots() == "checkpoint"
+        assert m.snapshot("before-pip") == "snapshot before-pip saved" and m.list_snapshots() == "before-pip\ncheckpoint"
+        assert "restored /workspace to snapshot before-pip" in m.restore("before-pip")
+        assert m.snapshot("c") == "snapshot c saved"  # the third and last of the default 3
+        assert m.snapshot("d") == "already 3 snapshots (before-pip, c, checkpoint): delete_snapshot() one, or reuse one of these tags"
+        assert "d" not in boxes[0].snaps
+        m.delete_snapshot("c")
+        assert m.snapshot("checkpoint") == "snapshot checkpoint saved"  # an existing tag is replaced, not a new slot
+        assert m.delete_snapshot("checkpoint") == "snapshot checkpoint deleted" and m.list_snapshots() == "before-pip"
+        assert m.restore("nope") == "no snapshot 'nope' of agvisor-proj"  # said to the agent, not a traceback
+        assert m.snapshot("a b").startswith("invalid snapshot tag") and m.snapshot("../x").startswith("invalid snapshot tag")
+        m.delete_snapshot("before-pip")
+        assert m.list_snapshots() == "no snapshots"
         m._sb = None
         assert "Only /workspace is kept" in m.run("x")  # boxes[1] is the one that dies; its files are not all gone
     m._sb = None
+    boxes.clear(), kws.clear()
+    with mock.patch.object(m, "create_sandbox", create), mock.patch.dict(os.environ, {"AGVISOR_NAME": "proj", "AGVISOR_SNAPSHOTS": "1"}):
+        m.snapshot("a")
+        assert m.snapshot("b").startswith("already 1 snapshots (a)") and m.snapshot("a") == "snapshot a saved"
+    m._sb = None
+    for bad in ("0", "-1", "two", ""):  # checked when the server starts: "" falls back to the default
+        with mock.patch.dict(os.environ, {"AGVISOR_SNAPSHOTS": bad}):
+            try:
+                m._snapshots()
+            except SystemExit:
+                assert bad != ""
+            else:
+                assert bad == ""
 
 
 def test_mcp_write_file():

@@ -5,8 +5,8 @@ AGVISOR_HOST (ssh://user@vm; default local docker / $DOCKER_HOST), AGVISOR_IMAGE
 AGVISOR_CPUS (2), AGVISOR_MEMORY (2g), AGVISOR_IDLE_TTL (600 s), AGVISOR_LIFETIME (3600 s).
 AGVISOR_EGRESS (unset): comma-separated hosts the sandbox may reach (create_sandbox(egress=)), e.g.
 "pypi.org,files.pythonhosted.org"; it replaces AGVISOR_NETWORK.
-AGVISOR_NAME (unset) makes the sandbox a named one: /workspace is kept in a docker volume, and the snapshot/restore
-tools exist.
+AGVISOR_NAME (unset) makes the sandbox a named one: /workspace is kept in a docker volume, and the snapshot tools
+(snapshot, restore, list_snapshots, delete_snapshot) exist. AGVISOR_SNAPSHOTS (3): how many snapshots may exist at once.
 AGVISOR_PUT_DIR (unset): HOST_DIR:/DEST, a directory of yours copied into the sandbox when it is made (put_dir), e.g.
 "/home/me/proj:/workspace/proj". Skipped when /DEST already exists, so a resumed named sandbox keeps its edits."""
 import atexit
@@ -20,7 +20,7 @@ from .sandbox import Job, SandboxGone, create_sandbox
 _MAX = 30_000  # characters of output handed back to the agent (the tail)
 _READ = 100_000  # read_file(): bytes of one file
 _EDIT = 1_000_000  # edit_file(): bytes of one file
-_CHECKPOINT = "checkpoint"  # ponytail: one snapshot slot, so an agent can't pile up full copies of /workspace
+_CHECKPOINT = "checkpoint"  # the tag snapshot() and restore() use when the agent names none
 _sb = None  # One sandbox per server process. Anonymous unless AGVISOR_NAME is set: then /workspace is a volume with
 _lock = threading.Lock()  # no size cap, shared by every server process using that name.
 
@@ -42,6 +42,17 @@ def _put():
     if not os.path.isdir(host) or not dest.startswith("/"):
         raise SystemExit(f"AGVISOR_PUT_DIR must be HOST_DIR:/DEST with HOST_DIR an existing directory, got {spec!r}")
     return host, dest
+
+
+def _snapshots():
+    """AGVISOR_SNAPSHOTS as an int >= 1: every snapshot is a full copy of /workspace, so the agent gets a fixed number."""
+    try:
+        n = int(_env("SNAPSHOTS", 3))
+    except ValueError:
+        n = 0
+    if n < 1:
+        raise SystemExit(f"AGVISOR_SNAPSHOTS must be a whole number >= 1, got {_env('SNAPSHOTS')!r}")
+    return n
 
 
 def _get():
@@ -214,22 +225,48 @@ def reset() -> str:
     return "sandbox destroyed; the next run() starts a fresh one"
 
 
-def snapshot() -> str:
-    """Save /workspace as the one checkpoint, replacing the previous one. Costs as much disk as /workspace. Don't
-    leave background processes writing to it: a copy taken during writes can be inconsistent."""
-    _get().snapshot(_CHECKPOINT)
-    return "checkpoint saved"
+def snapshot(tag: str = _CHECKPOINT) -> str:
+    """Save /workspace as snapshot `tag` (letters, digits, _ and -; default "checkpoint"), replacing a snapshot of that
+    name. Each one costs as much disk as /workspace, and only a few can exist at once: delete_snapshot() frees a slot.
+    Don't leave background processes writing to /workspace: a copy taken during writes can be inconsistent."""
+    sb = _get()
+    try:
+        have = sb.list_snapshots()
+        if tag not in have and len(have) >= _snapshots():
+            return f"already {len(have)} snapshots ({', '.join(have)}): delete_snapshot() one, or reuse one of these tags"
+        sb.snapshot(tag)
+    except ValueError as e:  # a tag that isn't valid
+        return str(e)
+    return f"snapshot {tag} saved"
 
 
-def restore() -> str:
-    """Put /workspace back to the checkpoint: everything in it now is erased, and the sandbox restarts (running
-    processes and anything outside /workspace are lost). Fails if there is no checkpoint yet."""
-    _get().restore(_CHECKPOINT)
-    return "restored /workspace to the checkpoint; the sandbox was restarted"
+def restore(tag: str = _CHECKPOINT) -> str:
+    """Put /workspace back to snapshot `tag`: everything in it now is erased, and the sandbox restarts (running
+    processes and anything outside /workspace are lost). The snapshot stays. See list_snapshots() for the tags."""
+    try:
+        _get().restore(tag)
+    except ValueError as e:  # an invalid tag, or none of that name
+        return str(e)
+    return f"restored /workspace to snapshot {tag}; the sandbox was restarted"
+
+
+def list_snapshots() -> str:
+    """The tags of the snapshots of /workspace, one per line."""
+    return "\n".join(_get().list_snapshots()) or "no snapshots"
+
+
+def delete_snapshot(tag: str) -> str:
+    """Delete snapshot `tag` and free its disk. Not an error if there is none of that name."""
+    try:
+        _get().delete_snapshot(tag)
+    except ValueError as e:
+        return str(e)
+    return f"snapshot {tag} deleted"
 
 
 def main():
-    _put()  # a bad AGVISOR_PUT_DIR stops the server here
+    _put()  # a bad AGVISOR_PUT_DIR or AGVISOR_SNAPSHOTS stops the server here
+    _snapshots()
     try:
         from mcp.server.mcpserver import MCPServer  # mcp 2.x: v1's FastMCP was renamed
     except ImportError:
@@ -248,5 +285,7 @@ def main():
     if _env("NAME"):  # snapshots need a named sandbox
         app.tool()(snapshot)
         app.tool()(restore)
+        app.tool()(list_snapshots)
+        app.tool()(delete_snapshot)
     atexit.register(reset)  # ponytail: skipped on SIGKILL; idle_ttl/lifetime delete the container anyway
     app.run()  # stdio
