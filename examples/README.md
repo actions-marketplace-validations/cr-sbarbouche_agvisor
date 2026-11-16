@@ -17,6 +17,7 @@ AGVISOR_HOST=ssh://user@my-vm uv run python examples/01_quickstart.py   # docker
 | [`05_egress_allowlist.py`](05_egress_allowlist.py) | `egress=`: `pip` works through the allowlist, everything else is refused |
 | [`06_isolated_network.py`](06_isolated_network.py) | `network="isolated"`: sandboxes can't connect to each other, the internet still works |
 | [`07_workspace_cap.py`](07_workspace_cap.py) | `Limits(workspace=...)`: a size cap on a named sandbox's `/workspace` (needs xfs with `pquota` on the host) |
+| [`08_browser.py`](08_browser.py) | a headless Chromium (Playwright) opens a page and takes a screenshot, behind gVisor |
 
 CI runs every script against real gVisor (the `gvisor` job), so they are not allowed to rot.
 To give a coding agent a sandbox instead of calling the library yourself, see [Coding agents](../README.md#coding-agents-skill--mcp-server).
