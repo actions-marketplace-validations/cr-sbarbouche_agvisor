@@ -240,6 +240,24 @@ with Pool(2, "python:3.12-slim", network="none", lifetime=600) as pool:   # two 
 - A spare is a running sandbox: it holds an idle sandbox's memory (tens of MB under gVisor) until acquired or `close()`d. When none is ready, `acquire()` makes one on the spot, so a pool never makes you wait longer than not having one.
 - From `asyncio`: `sb = await asyncio.to_thread(pool.acquire)`.
 
+### A browser inside
+
+Chromium runs under gVisor, so a page you didn't write can be opened, read and screenshotted without it touching your machine. Use [Playwright's image](https://mcr.microsoft.com/en-us/artifact/mar/playwright/python/about), which has the browsers, and install the matching Python package in the sandbox ([`examples/08_browser.py`](examples/08_browser.py)):
+
+```python
+with create_sandbox("mcr.microsoft.com/playwright/python:v1.65.2-noble", network="isolated",
+                    limits=Limits(memory="2g", shm="1g")) as sb:
+    sb.exec("pip install -q playwright==1.65.2", timeout=300)
+    sb.put("/tmp/browse.py", script)         # sync_playwright(): chromium.launch(), page.goto(), page.screenshot(...)
+    sb.exec("python3 /tmp/browse.py https://example.com")
+    png = sb.get("/tmp/page.png")
+```
+
+- Set `Limits(shm="1g")`: Chromium needs more than docker's 64 MB `/dev/shm`. Playwright's own launch flags are enough; the sandbox is gVisor's, not Chromium's.
+- Needs internet for the page and for `pip`, so `network="bridge"` or `"isolated"` (the example uses `"isolated"`: other sandboxes stay out of reach, the host and cloud metadata do not). `egress=` has not been tried with a browser.
+- Playwright's version must match the browsers in the image (the tag, `v1.65.2` above). The image is ~2 GB.
+- CI runs the example against real gVisor.
+
 ### Expiry and cleanup
 
 ```python
@@ -259,7 +277,7 @@ for sb in list_sandboxes(host="ssh://user@my-vm"):                 # every agvis
 
 ## Examples
 
-[`examples/`](examples/) has seven small, runnable scripts (quickstart, resuming and snapshots, limits, files and jobs, the egress allowlist, `network="isolated"`, the `/workspace` cap). CI runs all of them against real gVisor.
+[`examples/`](examples/) has eight small, runnable scripts (quickstart, resuming and snapshots, limits, files and jobs, the egress allowlist, `network="isolated"`, the `/workspace` cap, a headless browser). CI runs all of them against real gVisor.
 
 ## Coding agents (skill + MCP server)
 
