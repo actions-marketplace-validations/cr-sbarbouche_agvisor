@@ -203,6 +203,27 @@ sb.python("rows[:3]", timeout=30, restart=False)                                
 
 Like notebook cells: variables, imports and functions survive between calls, and the value of a last expression is printed. `r` is a `CompletedProcess`: a Python exception is a traceback in `r.stdout`, not a return code. At `timeout` (default 60 s) the code gets a `TimeoutError` and the session survives; stuck where that can't reach it (a C call), the session is killed and `returncode` is 124. 127 means no `python3` in the image (`python:3.12-slim` has it). `max_bytes` (default 30 KB) cuts what comes back, inside the sandbox. The interpreter is a process in the container, so it goes with it: a new one starts (and says so) after a reset, `lifetime` or `idle_ttl`. Each call is one `exec()`, so `timeout + 5` must stay under `idle_ttl`. It is also an MCP tool, `python`. `tests/test_gvisor_mcp.py` runs it against real gVisor.
 
+### Async
+
+`agvisor.aio` has the same sandboxes for `asyncio` code: every blocking call runs in a worker thread, so the event loop stays free and calls can run side by side.
+
+```python
+import asyncio
+from agvisor import aio
+
+async def main():
+    async with aio.AsyncSandbox("python:3.12-slim", lifetime=600) as sb:
+        a, b = await asyncio.gather(sb.exec("sleep 2; echo a"), sb.exec("sleep 2; echo b"))   # ~2 s, not 4
+        job = await sb.spawn("echo building; sleep 1; echo done")
+        print(await job.wait(), (await job.read()).decode())
+
+asyncio.run(main())
+```
+
+- `AsyncSandbox(...)` takes `Sandbox`'s arguments; `await aio.create_sandbox(...)` starts it without `async with`, and `aio.list_sandboxes()` returns `AsyncSandbox` handles. Methods, results and errors are the same as the synchronous ones, awaited. Attributes (`name`, `data_dir`, ...) are read as usual.
+- Cancelling an await (`asyncio.wait_for`, a cancelled task) stops waiting, not the command: it runs on in the sandbox until its own `timeout=` ends it. Pass a `timeout`.
+- `exec(on_output=)` can be a plain function (called in a worker thread) or an `async def` (awaited on your loop).
+
 ### Expiry and cleanup
 
 ```python
