@@ -188,7 +188,7 @@ Like notebook cells: variables, imports and functions survive between calls, and
 
 ### Warm pool
 
-`Pool` keeps sandboxes started and unused, so `acquire()` doesn't wait for `docker run` (on a remote `host=ssh://...`, also not for the round trips of starting one). Taking one starts a replacement in the background.
+`Pool` keeps sandboxes started and unused, so `acquire()` doesn't wait for `docker run` and what comes with it (the image check, and on a remote `host=ssh://...` the round trips of starting one): it costs one quick `exec`, a health check. Taking one starts a replacement in the background.
 
 ```python
 from agvisor import Pool
