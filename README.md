@@ -207,6 +207,22 @@ asyncio.run(main())
 - Cancelling an await (`asyncio.wait_for`, a cancelled task) stops waiting, not the command: it runs on in the sandbox until its own `timeout=` ends it. Pass a `timeout`.
 - `exec(on_output=)` can be a plain function (called in a worker thread) or an `async def` (awaited on your loop).
 
+### Warm pool
+
+`Pool` keeps sandboxes started and unused, so `acquire()` doesn't wait for `docker run` and what comes with it (the image check, and on a remote `host=ssh://...` the round trips of starting one): it costs one quick `exec`, a health check. Taking one starts a replacement in the background.
+
+```python
+from agvisor import Pool
+
+with Pool(2, "python:3.12-slim", network="none", lifetime=600) as pool:   # two ready at all times
+    with pool.acquire() as sb:                                            # at once; yours to stop()
+        sb.exec("echo hi")
+```
+
+- Same arguments as `create_sandbox()`, shared by every sandbox of the pool; anonymous and headless only (no `name=`, `owner=`, `gui=`). `lifetime=` or `idle_ttl=` is required: it ends spares that a crashed process leaves behind, and it counts from when a spare was made, not from `acquire()`. A spare that expired while it waited is skipped.
+- A spare is a running sandbox: it holds an idle sandbox's memory (tens of MB under gVisor) until acquired or `close()`d. When none is ready, `acquire()` makes one on the spot, so a pool never makes you wait longer than not having one.
+- From `asyncio`: `sb = await asyncio.to_thread(pool.acquire)`.
+
 ### Expiry and cleanup
 
 ```python
