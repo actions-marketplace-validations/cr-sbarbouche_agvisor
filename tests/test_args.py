@@ -852,6 +852,121 @@ def test_mcp_jobs():
     m._sb = None
 
 
+def test_pool():
+    import time
+
+    from agvisor import Pool, pool as pool_mod
+
+    class Fake:  # a sandbox: `dead` ones fail the health check the way an expired one does
+        made = []
+
+        def __init__(self, **kw):
+            self.kw, self.dead, self.stopped, self.rc = kw, False, False, 0
+            Fake.made.append(self)
+
+        def _short(self):
+            return 30
+
+        def exec(self, cmd, *, timeout):
+            if self.dead:
+                raise SandboxGone("agvisor-x is gone")
+            return subprocess.CompletedProcess([], self.rc, "", "")
+
+        def stop(self):
+            self.stopped = True
+
+    def wait(cond):
+        for _ in range(200):
+            if cond():
+                return
+            time.sleep(0.01)
+        raise AssertionError("the pool did not get there")
+
+    delay = [0]
+
+    def create(**kw):
+        time.sleep(delay[0])
+        return Fake(**kw)
+
+    with mock.patch.object(pool_mod, "create_sandbox", create):
+        p = Pool(2, "img", network="none", lifetime=60)
+        wait(lambda: p.spares == 2)
+        assert [f.kw for f in Fake.made] == [{"image": "img", "network": "none", "lifetime": 60}] * 2  # same arguments for all
+
+        a = p.acquire()
+        assert a is Fake.made[0] and not a.stopped
+        wait(lambda: p.spares == 2 and len(Fake.made) == 3)  # a replacement was made in the background
+
+        Fake.made[1].dead = True  # expired while waiting: skipped, and not handed out
+        b = p.acquire()
+        assert b is Fake.made[2] and Fake.made[1].stopped
+        wait(lambda: p.spares == 2)
+
+        Fake.made[3].rc = 1  # `true` failed: not a sandbox to hand out either
+        c = p.acquire()
+        assert c is Fake.made[4] and Fake.made[3].stopped
+
+        wait(lambda: p.spares == 2)
+        spares = list(p._spares)
+        p.close()
+        assert all(f.stopped for f in spares) and not (a.stopped or b.stopped or c.stopped)  # acquired ones are the caller's
+        try:
+            p.acquire()
+        except RuntimeError:
+            pass
+        else:
+            raise AssertionError("acquired from a closed pool")
+
+        # close() while a spare is still being made: it must not be left running
+        Fake.made.clear()
+        delay[0] = 0.3
+        p = Pool(1, lifetime=60)
+        p.close()
+        wait(lambda: Fake.made and Fake.made[0].stopped)
+        assert p.spares == 0
+
+        # an empty pool makes one on the spot
+        p = Pool(1, lifetime=60)
+        got = p.acquire()
+        assert isinstance(got, Fake)
+        p.close()
+        wait(lambda: p._making == 0)
+
+        # making a spare fails in the background: recorded, and acquire() makes its own (and raises if that fails too)
+        calls = []
+
+        def broken(**kw):
+            calls.append(1)
+            raise RuntimeError("no docker")
+
+        with mock.patch.object(pool_mod, "create_sandbox", broken):
+            p = Pool(1, lifetime=60)
+            wait(lambda: p.error is not None and p._making == 0)
+            assert str(p.error) == "no docker" and p.spares == 0
+            try:
+                p.acquire()
+            except RuntimeError as e:
+                assert str(e) == "no docker" and len(calls) >= 2
+            else:
+                raise AssertionError("swallowed a failed create")
+            p.close()
+            wait(lambda: p._making == 0)
+
+        with Pool(1, idle_ttl=60) as p:  # `with` closes
+            wait(lambda: p.spares == 1)
+            held = p._spares[0]
+        assert held.stopped
+
+    for bad in ({"size": 0, "lifetime": 5}, {"lifetime": 5, "name": "x"}, {"lifetime": 5, "owner": "x"}, {"lifetime": 5, "gui": True},
+                {}, {"lifetime": 0}):
+        try:
+            with mock.patch.object(pool_mod, "create_sandbox", create):
+                Pool(**bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"accepted {bad}")
+
+
 def test_put_dir_and_get_dir():
     import tarfile
     import tempfile
@@ -1361,6 +1476,7 @@ if __name__ == "__main__":
     test_egress_args()
     test_egress_proxy()
     test_jobs()
+    test_pool()
     test_put_dir_and_get_dir()
     test_cli()
     test_mcp_server()
