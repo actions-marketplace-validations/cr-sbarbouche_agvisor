@@ -73,6 +73,11 @@ def _py(arg, max_bytes):
             f"S={shlex.quote(_PYSESSION)}; export S; python3 -c \"$S\" {arg} 2>&1 | tail -c {int(max_bytes)}")
 
 
+def _bytes(text):  # docker's "20.6MiB", "2GiB", "0B"
+    n, unit = re.fullmatch(r"([\d.]+)([KMGTP]?i?B)", text.strip()).groups()
+    return round(float(n) * 1024 ** "BKMGTP".index(unit[0]))
+
+
 class SandboxGone(RuntimeError):
     """exec() found the container dead or deleted: killed for going over memory/pids, expired (lifetime/idle_ttl), or
     removed. It is not a failed command. Named sandboxes: create_sandbox(name=...) again gives a fresh container on
@@ -418,6 +423,22 @@ class Sandbox:
         the sandbox was made. docker's own error if it wasn't published: a resumed sandbox keeps the ports of its first start."""
         out = self._docker("port", self.name, f"{int(container_port)}/tcp").stdout
         return int(out.splitlines()[0].rsplit(":", 1)[1])
+
+    def stats(self):
+        """What the sandbox uses right now, from `docker stats` (it takes about a second, CPU needs two samples):
+        {"cpu": percent of one core (200.0 = two busy), "memory": bytes, "memory_limit": bytes, "pids": int}.
+        Under gVisor, `memory` counts RAM and /tmp (RAM-backed) but not files on the root filesystem or /workspace. `pids`
+        is what --pids-limit counts: the sandbox's own threads are in it, an idle sandbox reads ~35, so compare it
+        with limits.pids, not with the number of processes you started. SandboxGone if the container is gone."""
+        r = self._docker("stats", "--no-stream", "--format", "{{json .}}", self.name, check=False)
+        if r.returncode:
+            if "no such container" in r.stderr.lower():
+                raise SandboxGone(f"{self.name} is gone: {r.stderr.strip()[-300:]}")
+            raise RuntimeError(r.stderr.strip())
+        row = json.loads(r.stdout)
+        used, _, limit = row["MemUsage"].partition(" / ")
+        return {"cpu": float(row["CPUPerc"].rstrip("%")), "memory": _bytes(used), "memory_limit": _bytes(limit),
+                "pids": int(row["PIDs"])}
 
     def exec(self, cmd, *, input=None, timeout=120, on_output=None):
         """Run a shell command inside. Returns CompletedProcess; returncode 124 = timed out.
