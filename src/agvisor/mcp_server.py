@@ -232,6 +232,20 @@ def kill_job(job_id: str) -> str:
     return f"sent TERM to job {job_id}"
 
 
+def stats() -> str:
+    """How much of its limits the sandbox is using right now: CPU, memory, processes. Look when a command died or was
+    killed (out of memory?), or before something big. Takes about a second. Memory counts RAM and /tmp (RAM-backed here),
+    not files on disk; the process count includes the sandbox's own threads (about 35 when idle)."""
+    try:
+        sb = _get()
+        s = sb.stats()
+    except SandboxGone as e:
+        return _gone(e)
+    mib = lambda n: round(n / 2**20)
+    return (f"cpu {s['cpu']:.0f}% (limit {sb.limits.cpus * 100:.0f}%); memory {mib(s['memory'])} of {mib(s['memory_limit'])} MiB; "
+            f"processes {s['pids']} (limit {sb.limits.pids})")
+
+
 def reset() -> str:
     """Destroy the sandbox and everything in it. The next run() starts a fresh one. With snapshot/restore tools,
     /workspace survives: use restore() to roll that back."""
@@ -301,6 +315,7 @@ def main():
     app.tool()(job_output)
     app.tool()(kill_job)
     app.tool()(reset)
+    app.tool()(stats)
     if _env("NAME"):  # snapshots need a named sandbox
         app.tool()(snapshot)
         app.tool()(restore)

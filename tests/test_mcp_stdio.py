@@ -14,7 +14,7 @@ from mcp import Client, StdioServerParameters
 
 from agvisor import Sandbox
 
-TOOLS = {"run", "write_file", "read_file", "edit_file", "python", "list_files", "start_job", "job_output", "kill_job", "reset"}
+TOOLS = {"run", "write_file", "read_file", "edit_file", "python", "list_files", "start_job", "job_output", "kill_job", "reset", "stats"}
 host = os.environ.get("AGVISOR_HOST")
 # the stdio client hands the server only a few variables by default: pass everything, plus a throwaway-friendly config
 env = {**os.environ, "AGVISOR_NETWORK": "none", "AGVISOR_IDLE_TTL": "120", "AGVISOR_LIFETIME": "600"}
@@ -78,6 +78,9 @@ async def main():
                 break
             await asyncio.sleep(1)
         assert "job-ran" in log, log
+
+        out = await text(c, "stats")
+        assert "memory" in out and "MiB" in out and "processes" in out, out  # a line for the agent: cpu, memory, processes, each with its limit
 
         assert "cannot" in await text(c, "read_file", path="/tmp/missing")  # a failure comes back as text, the server lives
         assert "[exit 0]" in await text(c, "run", command="true")
