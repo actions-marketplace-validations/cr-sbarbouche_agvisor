@@ -24,10 +24,12 @@ import re
 import socket
 import ssl
 import tempfile
+import time
 from urllib.parse import urlsplit
 
 PORT = 3128
 _MAX = 256  # concurrent connections; the container's memory is the real limit
+_IDLE = 900  # seconds a tunnel may carry no byte in either direction before it is closed: longer than a quiet request is expected to take
 _NAME = re.compile(r"(\*\.)?[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*")
 _HEADER = re.compile(r"[!#$%&'*+.^_`|~0-9A-Za-z-]+")
 _NOT_INJECTED = {"host", "content-length", "transfer-encoding", "connection", "keep-alive", "proxy-authorization",
@@ -127,9 +129,21 @@ async def _reply(w, code, why, body="", extra=""):
     await w.drain()
 
 
-async def _pipe(r, w):
+async def _pipe(r, w, seen):
+    """r -> w until r ends. seen[0] is when either direction of this tunnel last carried a byte: one that stays quiet
+    for _IDLE seconds is closed, so a stalled connection doesn't hold a socket until the sandbox goes."""
     try:
-        while data := await r.read(65536):
+        while True:
+            try:
+                data = await asyncio.wait_for(r.read(65536), max(seen[0] + _IDLE - time.monotonic(), 0))
+            except asyncio.TimeoutError:
+                if time.monotonic() - seen[0] < _IDLE:  # the other direction moved meanwhile: a download says nothing back
+                    continue
+                w.close()
+                return
+            if not data:
+                break
+            seen[0] = time.monotonic()
             w.write(data)
             await w.drain()
         if w.can_write_eof():
@@ -236,7 +250,8 @@ async def serve(rules, token, host="0.0.0.0", port=PORT, inject=None, server_ctx
                     drop = {"proxy-authorization", "proxy-connection", "connection", "keep-alive"}
                     uw.write(f"{method} {path} {version}\r\n".encode("latin-1")
                              + "".join(f"{l}\r\n" for k, _, l in hdr if k not in drop).encode("latin-1") + b"Connection: close\r\n\r\n")
-                await asyncio.gather(_pipe(cr, uw), _pipe(ur, cw))  # ponytail: no idle timeout on a tunnel
+                seen = [time.monotonic()]
+                await asyncio.gather(_pipe(cr, uw, seen), _pipe(ur, cw, seen))
             finally:
                 uw.close()
         except (OSError, asyncio.IncompleteReadError, asyncio.LimitOverrunError):
