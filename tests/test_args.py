@@ -1823,6 +1823,54 @@ def test_async():
         asyncio.run(scenario())
 
 
+def test_stats():
+    from agvisor.sandbox import _bytes
+
+    assert [_bytes(t) for t in ("0B", "512KiB", "20.6MiB", "2GiB", "1.5TiB")] == [0, 512 * 1024, round(20.6 * 2**20), 2 * 2**30, round(1.5 * 2**40)]
+    row = ('{"BlockIO":"0B / 0B","CPUPerc":"100.97%","Container":"agvisor-f3de3e82","ID":"0a379debb8a6","MemPerc":"11.40%",'
+           '"MemUsage":"233.5MiB / 2GiB","Name":"agvisor-f3de3e82","NetIO":"1.11kB / 210B","PIDs":"52"}')  # as docker 29 printed it on runsc
+    calls = []
+
+    def run(cmd, **_):
+        calls.append(cmd)
+        if "gone" in cmd:
+            return subprocess.CompletedProcess(cmd, 1, "", "Error response from daemon: No such container: gone\n")
+        if "broken" in cmd:
+            return subprocess.CompletedProcess(cmd, 1, "", "Cannot connect to the Docker daemon")
+        return subprocess.CompletedProcess(cmd, 0, row + "\n", "")
+
+    sb = Sandbox()
+    with mock.patch("agvisor.sandbox.subprocess.run", run):
+        assert sb.stats() == {"cpu": 100.97, "memory": round(233.5 * 2**20), "memory_limit": 2 * 2**30, "pids": 52}
+        assert calls[-1] == ["docker", "stats", "--no-stream", "--format", "{{json .}}", sb.name]
+        for name, exc in (("gone", SandboxGone), ("broken", RuntimeError)):
+            sb.name = name
+            try:
+                sb.stats()
+            except exc as e:
+                assert type(e) is exc, e  # a gone sandbox is not just any docker error
+            else:
+                raise AssertionError(f"{name}: expected {exc}")
+
+
+def test_mcp_stats():
+    from agvisor import mcp_server as m
+
+    class Fake:
+        idle_ttl, limits = 600, Limits(cpus=2, pids=512)
+
+        def stats(self):
+            return {"cpu": 101.4, "memory": 243 * 2**20, "memory_limit": 2048 * 2**20, "pids": 74}
+
+        def stop(self):
+            pass
+
+    m._sb = None
+    with mock.patch.object(m, "create_sandbox", lambda *a, **kw: Fake()):
+        assert m.stats() == "cpu 101% (limit 200%); memory 243 of 2048 MiB; processes 74 (limit 512)"
+    m.reset()
+
+
 def test_skill_frontmatter_is_strict_yaml():
     # Claude Code and OpenCode forgive a bare `: ` inside a value; VS Code's strict YAML parser rejects the skill
     path = Path(__file__).parent.parent / ".claude/skills/agvisor/SKILL.md"
@@ -1875,5 +1923,7 @@ if __name__ == "__main__":
     test_mcp_put_dir()
     test_mcp_jobs()
     test_async()
+    test_stats()
+    test_mcp_stats()
     test_skill_frontmatter_is_strict_yaml()
     print("ok")
