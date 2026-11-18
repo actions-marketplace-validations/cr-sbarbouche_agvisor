@@ -1809,6 +1809,7 @@ def test_async():
 
             assert not hasattr(sb, "nothing") and copy.copy(sb)._obj is sb._obj  # no endless __getattr__ on a bare copy
             assert inspect.iscoroutinefunction(aio.AsyncSandbox.exec) and "timeout" in inspect.signature(aio.AsyncSandbox.exec).parameters
+            assert all(inspect.iscoroutinefunction(getattr(aio.AsyncSandbox, n)) for n in ("port", "stats"))  # each runs a docker command
         assert calls[-1][1:3] == ["rm", "-f"]  # `async with` stopped it
         tick.cancel()
 
@@ -1871,6 +1872,90 @@ def test_mcp_stats():
     m.reset()
 
 
+def test_ports():
+    a = Sandbox(ports=[8000, 3000]).run_args()
+    assert "--publish=127.0.0.1::8000" in a and "--publish=127.0.0.1::3000" in a  # loopback only, a random host port
+    assert a.index("--publish=127.0.0.1::8000") < a.index("ubuntu:24.04")  # a docker flag only works before the image
+    assert not any(x.startswith("--publish") for x in Sandbox().run_args())  # nothing is published unless asked
+    assert "--publish=127.0.0.1::80" in Sandbox(ports=[80], network="isolated").run_args()
+    for bad in ([], [0], [65536], [True], ["80"], [80.0], [80, 80]):
+        try:
+            Sandbox(ports=bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"accepted ports={bad!r}")
+    for bad in ({"gui": True}, {"network": "none"}, {"egress": ["x.org"]}, {"inject": {"x.com": {"A": "b"}}}):
+        try:
+            Sandbox(ports=[80], **bad)  # no route in from the host: docker would drop the port silently or refuse
+        except ValueError:
+            continue
+        raise AssertionError(f"accepted ports with {bad!r}")
+    sb = Sandbox(ports=[8000])
+    calls, run = fake_docker()
+    with mock.patch("agvisor.sandbox.subprocess.run", run):
+        assert sb.port(8000) == 49153 and calls[-1] == ["docker", "port", sb.name, "8000/tcp"]
+        assert sb.port("9000") == 49153 and calls[-1][-1] == "9000/tcp"  # a number in a string is fine
+    calls, run = fake_docker(fail=("8000/tcp",))  # never published: docker says so
+    with mock.patch("agvisor.sandbox.subprocess.run", run):
+        try:
+            sb.port(8000)
+        except RuntimeError as e:
+            assert str(e) == "boom"
+        else:
+            raise AssertionError("expected docker's error")
+
+
+def test_mcp_ports():
+    from agvisor import mcp_server as m
+
+    def env(**kw):
+        return mock.patch.dict(os.environ, {f"AGVISOR_{k}": v for k, v in kw.items()})
+
+    assert m._ports() is None
+    with env(PORTS="8000,3000", NETWORK="bridge"):
+        assert m._ports() == [8000, 3000]
+    for bad in ({"PORTS": "8000"},  # AGVISOR_NETWORK defaults to "none": no way in
+                {"PORTS": "8000", "NETWORK": "bridge", "EGRESS": "pypi.org"}, {"PORTS": "8000", "NETWORK": "bridge", "INJECT": "{}"},
+                {"PORTS": "web", "NETWORK": "bridge"}, {"PORTS": "0", "NETWORK": "bridge"}, {"PORTS": "80,", "NETWORK": "bridge"}):
+        with env(**bad):
+            try:
+                m._ports()
+            except SystemExit as e:
+                assert "AGVISOR_PORTS" in str(e)
+            else:
+                raise AssertionError(f"accepted {bad!r}")
+
+    class Fake:
+        idle_ttl, host = 600, None
+
+        def port(self, p):
+            if p != 8000:
+                raise RuntimeError(f"No public port '{p}/tcp' published for agvisor-x")
+            return 49153
+
+        def stop(self):
+            pass
+
+    made = {}
+
+    def create(*a, **kw):
+        made.update(kw)
+        return Fake()
+
+    m._sb = None
+    with mock.patch.object(m, "create_sandbox", create), env(PORTS="8000", NETWORK="bridge"):
+        assert m.port(8000) == "127.0.0.1:49153" and made["ports"] == [8000] and made["network"] == "bridge"
+        assert m.port(9) == "No public port '9/tcp' published for agvisor-x"  # the agent is told, not given a traceback
+        m._sb.host = "ssh://u@vm"
+        assert m.port(8000) == "127.0.0.1:49153 on ssh://u@vm"  # that machine's loopback, not the agent's host
+    m.reset()
+    m._sb = None
+    with mock.patch.object(m, "create_sandbox", create):
+        m.port(8000)
+        assert made["ports"] is None  # not asked for: nothing published
+    m.reset()
+
+
 def test_skill_frontmatter_is_strict_yaml():
     # Claude Code and OpenCode forgive a bare `: ` inside a value; VS Code's strict YAML parser rejects the skill
     path = Path(__file__).parent.parent / ".claude/skills/agvisor/SKILL.md"
@@ -1925,5 +2010,7 @@ if __name__ == "__main__":
     test_async()
     test_stats()
     test_mcp_stats()
+    test_ports()
+    test_mcp_ports()
     test_skill_frontmatter_is_strict_yaml()
     print("ok")

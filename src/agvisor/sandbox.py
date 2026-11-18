@@ -155,7 +155,7 @@ class Sandbox:
     """host=None -> local docker; host="ssh://user@vm" -> docker on a remote VM/server."""
 
     def __init__(self, image=None, *, gui=False, limits=Limits(), network="bridge", lifetime=None,
-                 idle_ttl=None, name=None, owner=None, host=None, runtime="runsc", egress=None, inject=None):
+                 idle_ttl=None, name=None, owner=None, host=None, runtime="runsc", egress=None, inject=None, ports=None):
         self.gui, self.limits, self.network, self.lifetime, self.host = gui, limits, network, lifetime, host
         self.idle_ttl, self.runtime = idle_ttl, runtime
         # strict like `name`: it ends up in --runtime=. And never plain runc for a gui: it is run --privileged
@@ -187,6 +187,13 @@ class Sandbox:
             if not egress:
                 raise ValueError("egress is empty: that is network='none'")
             egress_proxy.parse_rules(egress)  # raises ValueError on an entry it can't use
+        if ports is not None:
+            ports = list(ports)
+            if not ports or len(set(ports)) != len(ports) or any(type(p) is not int or not 0 < p < 65536 for p in ports):
+                raise ValueError(f"ports must be distinct whole numbers from 1 to 65535, got {ports!r}")
+            if gui or network == "none" or egress is not None:  # docker publishes through the bridge: neither of these has a route in
+                raise ValueError("ports= needs a network the host can reach: headless only, not network='none', egress= or inject=")
+        self.ports = ports
         self.egress, self._has_egress = egress, egress is not None  # _has_egress: also true for handles from list_sandboxes()
         self.inject, self._ca = inject, None  # _ca: the certificate the sandbox must trust, made by _egress_up()
         self.owner = owner
@@ -244,6 +251,7 @@ class Sandbox:
             a += ["--privileged", f"--shm-size={l.shm or '1g'}", f"--publish=127.0.0.1::{RDP_PORT}"]
         elif l.shm:
             a.append(f"--shm-size={l.shm}")
+        a += [f"--publish=127.0.0.1::{p}" for p in self.ports or ()]  # a random free port on the docker host's loopback
         if not self.gui:  # PID 1 is `sleep`, which never reaps orphans: they stay zombies and eat the pids limit
             a.append("--init")  # (gui: systemd is PID 1 and reaps)
             # an image ENTRYPOINT would swallow our PID 1 command as its arguments. exec() bypasses it anyway, so
@@ -395,8 +403,7 @@ class Sandbox:
             if self._ca and not resumed:  # trusts the CA before anything can make a request
                 self._docker("exec", "-i", "-u", "root", self.name, "sh", "-c", _TRUST, input=self._ca)
             if self.gui:  # random host port + random password instead of the image's gnome:gnome
-                out = self._docker("port", self.name, f"{RDP_PORT}/tcp").stdout
-                self.rdp_port = int(out.splitlines()[0].rsplit(":", 1)[1])
+                self.rdp_port = self.port(RDP_PORT)
                 self.password = secrets.token_urlsafe(12)  # urlsafe: no quote that could break the file below
                 self._docker("exec", "-i", "-u", "root", self.name, "chpasswd",
                              input=f"{GUI_USER}:{self.password}\n")  # sudo / console login
@@ -410,6 +417,12 @@ class Sandbox:
                 self.stop()
             raise
         return self
+
+    def port(self, container_port):
+        """The port on the docker host (127.0.0.1 there) that reaches `container_port`, one of the ports= given when
+        the sandbox was made. docker's own error if it wasn't published: a resumed sandbox keeps the ports of its first start."""
+        out = self._docker("port", self.name, f"{int(container_port)}/tcp").stdout
+        return int(out.splitlines()[0].rsplit(":", 1)[1])
 
     def stats(self):
         """What the sandbox uses right now, from `docker stats` (it takes about a second, CPU needs two samples):
@@ -722,6 +735,7 @@ def create_sandbox(
     runtime: str = "runsc",
     egress: list[str] | None = None,
     inject: dict[str, dict[str, str]] | None = None,
+    ports: list[int] | None = None,
 ) -> Sandbox:
     """Create and start a gVisor sandbox. Use `with create_sandbox(...) as sb:` or call sb.stop() yourself.
 
@@ -763,6 +777,11 @@ def create_sandbox(
               443 only (http:// to it is refused). One request per connection: no keep-alive, no websockets. Pip, curl,
               requests, node and git trust the CA through the usual environment variables; other clients (java, a program
               that pins certificates) do not. Needs pip install 'agvisor[inject]'. Same restrictions as egress=.
+    ports    Container ports to reach from the host, e.g. [8000] for a dev server started with spawn(). Each is published
+              on a random free port of 127.0.0.1 on the docker host (never on its other addresses): sb.port(8000) says which.
+              With host="ssh://..." that is the remote machine's loopback: tunnel to it (ssh -L). Needs a network the host can
+              reach: headless only, not network="none", egress= or inject=. Fixed at creation, like limits. idle_ttl counts
+              exec() calls, not connections: use lifetime for a sandbox you are browsing.
     runtime  The docker runtime, default "runsc". Name a second one (e.g. "runsc-gui", same runsc plus the GUI
               flags) to keep the strict one for headless sandboxes. Must be a gVisor runtime: plain runc is
               refused for gui, which runs --privileged.
@@ -776,4 +795,4 @@ def create_sandbox(
               "ssh://user@host" -> docker on a remote VM/server, e.g. an EC2 or Azure VM.
     """
     return Sandbox(image, gui=gui, limits=limits, network=network, lifetime=lifetime, idle_ttl=idle_ttl,
-                   name=name, owner=owner, host=host, runtime=runtime, egress=egress, inject=inject).start()
+                   name=name, owner=owner, host=host, runtime=runtime, egress=egress, inject=inject, ports=ports).start()
