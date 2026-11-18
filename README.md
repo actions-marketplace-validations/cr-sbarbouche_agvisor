@@ -255,9 +255,10 @@ with create_sandbox("mcr.microsoft.com/playwright/python:v1.65.2-noble", network
 ```
 
 - Set `Limits(shm="1g")`: Chromium needs more than docker's 64 MB `/dev/shm`. Playwright's own launch flags are enough; the sandbox is gVisor's, not Chromium's.
-- Needs internet for the page and for `pip`, so `network="bridge"` or `"isolated"` (the example uses `"isolated"`: other sandboxes stay out of reach, the host and cloud metadata do not). `egress=` has not been tried with a browser.
+- Needs internet for the page and for `pip`, so `network="bridge"` or `"isolated"` (the example uses `"isolated"`: other sandboxes stay out of reach, the host and cloud metadata do not).
+- To let the browser reach only some hosts, use `egress=` and hand the proxy to Chromium, which ignores `HTTPS_PROXY`: parse that variable in the script and pass `chromium.launch(proxy={"server": ..., "username": ..., "password": ...})` ([`examples/09_browser_egress.py`](https://github.com/cr-sbarbouche/agvisor/blob/main/examples/09_browser_egress.py)). A host that is not listed fails with `net::ERR_TUNNEL_CONNECTION_FAILED`.
 - Playwright's version must match the browsers in the image (the tag, `v1.65.2` above). The image is ~2 GB.
-- CI runs the example against real gVisor.
+- CI runs both examples against real gVisor.
 
 ### Expiry and cleanup
 
