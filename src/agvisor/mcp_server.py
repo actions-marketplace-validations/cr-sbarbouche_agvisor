@@ -8,6 +8,8 @@ AGVISOR_EGRESS (unset): comma-separated hosts the sandbox may reach (create_sand
 AGVISOR_INJECT (unset): credentials the sandbox can use but never sees, JSON like
 {"api.example.com": {"Authorization": "Bearer sk-..."}} (create_sandbox(inject=); needs agvisor[inject]); those hosts are
 reachable, and it replaces AGVISOR_NETWORK like AGVISOR_EGRESS does.
+AGVISOR_PORTS (unset): comma-separated container ports to reach from your machine, e.g. "8000,3000" (create_sandbox(ports=));
+the agent learns the address from the port tool. Needs AGVISOR_NETWORK=bridge or isolated, and no AGVISOR_EGRESS/AGVISOR_INJECT.
 AGVISOR_NAME (unset) makes the sandbox a named one: /workspace is kept in a docker volume, and the snapshot tools
 (snapshot, restore, list_snapshots, delete_snapshot) exist. AGVISOR_SNAPSHOTS (3): how many snapshots may exist at once.
 AGVISOR_PUT_DIR (unset): HOST_DIR:/DEST, a directory of yours copied into the sandbox when it is made (put_dir), e.g.
@@ -20,7 +22,7 @@ import threading
 
 from . import egress_proxy
 from .limits import Limits
-from .sandbox import Job, SandboxGone, create_sandbox
+from .sandbox import Job, Sandbox, SandboxGone, create_sandbox
 
 _MAX = 30_000  # characters of output handed back to the agent (the tail)
 _READ = 100_000  # read_file(): bytes of one file
@@ -71,6 +73,22 @@ def _snapshots():
     return n
 
 
+def _ports():
+    """AGVISOR_PORTS as a list of ints, or None. Checked when the server starts, not on the agent's first call."""
+    raw = _env("PORTS")
+    if not raw:
+        return None
+    try:
+        ports = [int(p) for p in raw.split(",")]
+        Sandbox(ports=ports)  # the same checks as create_sandbox()
+    except ValueError as e:
+        raise SystemExit(f"AGVISOR_PORTS must be ports like 8000,3000: {e}") from None
+    if _env("EGRESS") or _env("INJECT") or _env("NETWORK", "none") == "none":
+        raise SystemExit("AGVISOR_PORTS needs AGVISOR_NETWORK=bridge or isolated, and no AGVISOR_EGRESS or AGVISOR_INJECT: "
+                         "a port is reached through a network the host can see into")
+    return ports
+
+
 def _get():
     global _sb
     with _lock:
@@ -80,7 +98,7 @@ def _get():
             net = {**({"egress": egress} if egress else {}), **({"inject": inject} if inject else {})}
             sb = create_sandbox(
                 _env("IMAGE"), host=_env("HOST"), name=_env("NAME"),
-                **(net or {"network": _env("NETWORK", "none")}),
+                **(net or {"network": _env("NETWORK", "none")}), ports=_ports(),
                 limits=Limits(cpus=float(_env("CPUS", 2)), memory=_env("MEMORY", "2g")),
                 idle_ttl=int(_env("IDLE_TTL", 600)), lifetime=int(_env("LIFETIME", 3600)))
             try:
@@ -232,6 +250,17 @@ def kill_job(job_id: str) -> str:
     return f"sent TERM to job {job_id}"
 
 
+def port(container_port: int) -> str:
+    """The address on the user's machine that reaches `container_port` of the sandbox (one the user allowed), for a
+    server you started with start_job: give it to the user, who opens it in a browser. Inside the sandbox the same server
+    is at localhost:<container_port>. It lives as long as the sandbox, which expires when idle: calls to run() keep it up."""
+    try:
+        sb = _get()
+        return f"127.0.0.1:{sb.port(container_port)}" + (f" on {sb.host}" if sb.host else "")
+    except RuntimeError as e:  # docker's own words: that port isn't published, or the container is gone
+        return str(e)
+
+
 def reset() -> str:
     """Destroy the sandbox and everything in it. The next run() starts a fresh one. With snapshot/restore tools,
     /workspace survives: use restore() to roll that back."""
@@ -286,6 +315,7 @@ def main():
     _put()  # a bad AGVISOR_PUT_DIR, AGVISOR_SNAPSHOTS or AGVISOR_INJECT stops the server here
     _snapshots()
     _inject()
+    ports = _ports()
     try:
         from mcp.server.mcpserver import MCPServer  # mcp 2.x: v1's FastMCP was renamed
     except ImportError:
@@ -301,6 +331,8 @@ def main():
     app.tool()(job_output)
     app.tool()(kill_job)
     app.tool()(reset)
+    if ports:
+        app.tool()(port)
     if _env("NAME"):  # snapshots need a named sandbox
         app.tool()(snapshot)
         app.tool()(restore)

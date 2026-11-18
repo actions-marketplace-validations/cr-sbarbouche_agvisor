@@ -73,8 +73,8 @@ class AsyncSandbox(_Wrapper):
     start = _call(Sandbox, "start", lambda self, _: self)
     restore = _call(Sandbox, "restore", lambda self, _: self)
     spawn = _call(Sandbox, "spawn", lambda self, job: AsyncJob(job))
-    exec, python, put, put_dir, get, get_dir, stop, delete, snapshot, list_snapshots, delete_snapshot = (
-        _call(Sandbox, n) for n in ("exec", "python", "put", "put_dir", "get", "get_dir", "stop", "delete",
+    exec, python, put, put_dir, get, get_dir, port, stop, delete, snapshot, list_snapshots, delete_snapshot = (
+        _call(Sandbox, n) for n in ("exec", "python", "put", "put_dir", "get", "get_dir", "port", "stop", "delete",
                                     "snapshot", "list_snapshots", "delete_snapshot"))
 
 

@@ -193,6 +193,16 @@ Job(sb, job_id).wait()                                         # pick a job up a
 
 `exec(timeout=)` has to stay under `idle_ttl`, so anything longer goes here. A job writes to `/var/tmp/.agvisor-jobs/<id>/` (the root filesystem, so `Limits.disk` caps its log). Exit codes: 124 = hit its `timeout`, 143 = killed (TERM), 137 = KILL. `wait()` makes one `exec()` per ~25 s. A running job does **not** keep an `idle_ttl` sandbox alive (background processes never did), but `poll()`, `read()` and `wait()` are execs, so a client that checks on it does; set `lifetime` for a hard budget. `Limits.disk` is the only cap on how much a job logs. `tests/test_gvisor_jobs.py` runs this against real gVisor.
 
+### Reaching a server inside
+
+```python
+with create_sandbox("python:3.12-slim", ports=[8000], lifetime=3600) as sb:
+    sb.spawn("python3 -m http.server 8000")                  # a dev server, or anything that listens
+    print(f"http://127.0.0.1:{sb.port(8000)}")               # the same server, from this machine
+```
+
+`ports=` publishes each container port on a random free port of `127.0.0.1` on the docker host, never on its other addresses; `sb.port(8000)` says which. It is fixed when the sandbox is made, and a resumed sandbox keeps the ports of its first start. It needs a network the host can reach into: headless, `network="bridge"` or `"isolated"` (a sandbox on `"none"`, or behind `egress=` / `inject=`, has no way in). With `host="ssh://..."` the port is on that machine's loopback: `ssh -L 8000:127.0.0.1:<port> user@vm`. `idle_ttl` counts `exec()` calls, not connections, so give a sandbox you are browsing a `lifetime`. `tests/test_gvisor_ports.py` runs this against real gVisor.
+
 ### Python sessions
 
 ```python
@@ -294,6 +304,7 @@ Settings are environment variables, so the agent can't pick its own image, netwo
 | `AGVISOR_NETWORK` | `none` (no internet: `pip install` fails). `bridge` for internet |
 | `AGVISOR_EGRESS` | unset. Comma-separated hosts the sandbox may reach, e.g. `pypi.org,files.pythonhosted.org`: [`egress=`](#limiting-outbound-traffic), instead of `AGVISOR_NETWORK` |
 | `AGVISOR_INJECT` | unset. Credentials the sandbox can use but not read, as JSON: `{"api.example.com": {"Authorization": "Bearer sk-..."}}` ([`inject=`](#credentials-the-sandbox-can-use-but-not-read), needs `agvisor[inject]`). Those hosts are reachable; it replaces `AGVISOR_NETWORK` like `AGVISOR_EGRESS`, and can be combined with it |
+| `AGVISOR_PORTS` | unset. Comma-separated container ports to reach from your machine, e.g. `8000,3000` ([`ports=`](#reaching-a-server-inside)); adds a `port(container_port)` tool that returns the address. Needs `AGVISOR_NETWORK=bridge` or `isolated`, without `AGVISOR_EGRESS` / `AGVISOR_INJECT` |
 | `AGVISOR_IMAGE` | `ubuntu:24.04` |
 | `AGVISOR_CPUS` / `AGVISOR_MEMORY` | `2` / `2g` |
 | `AGVISOR_IDLE_TTL` / `AGVISOR_LIFETIME` | `600` / `3600` seconds |
