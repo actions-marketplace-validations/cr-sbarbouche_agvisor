@@ -1824,6 +1824,43 @@ def test_async():
         asyncio.run(scenario())
 
 
+def test_egress_proxy_idle():
+    import asyncio
+    import base64
+    import time
+
+    from agvisor import egress_proxy as p
+
+    closed = asyncio.Event()
+
+    async def origin(r, w):  # a download: five bytes 0.1 s apart, then silence with the connection left open
+        for _ in range(5):
+            w.write(b"x")
+            await w.drain()
+            await asyncio.sleep(0.1)
+        await r.read()  # returns when the proxy closes its side of the tunnel
+        closed.set()
+
+    async def main():
+        o = await asyncio.start_server(origin, "127.0.0.1", 0)
+        op = o.sockets[0].getsockname()[1]
+        srv = await p.serve(p.parse_rules([f"127.0.0.1:{op}"]), "tok", "127.0.0.1", 0)
+        r, w = await asyncio.open_connection("127.0.0.1", srv.sockets[0].getsockname()[1])
+        w.write(f"CONNECT 127.0.0.1:{op} HTTP/1.1\r\nProxy-Authorization: Basic ".encode() + base64.b64encode(b"agvisor:tok") + b"\r\n\r\n")
+        await r.readuntil(b"\r\n\r\n")
+        t0 = time.monotonic()
+        body = await asyncio.wait_for(r.read(), 10)  # until the proxy ends it
+        took = time.monotonic() - t0
+        # the client sent nothing for the whole 0.5 s of the download, longer than _IDLE: only quiet in BOTH directions counts
+        assert body == b"xxxxx", body
+        assert 0.7 < took < 3, took  # and then the silence ended it, about _IDLE later
+        await asyncio.wait_for(closed.wait(), 3)  # the upstream side was closed too
+        w.close()
+
+    with mock.patch.object(p, "_IDLE", 0.3), contextlib.redirect_stdout(io.StringIO()):
+        asyncio.run(main())
+
+
 def test_stats():
     from agvisor.sandbox import _bytes
 
@@ -1996,6 +2033,7 @@ if __name__ == "__main__":
     test_inject_args()
     test_egress_inject()
     test_egress_proxy()
+    test_egress_proxy_idle()
     test_jobs()
     test_pool()
     test_put_dir_and_get_dir()
