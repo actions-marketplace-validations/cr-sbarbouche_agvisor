@@ -39,6 +39,7 @@ def main(argv=None):
     r = sub.add_parser("run", help="make a sandbox, run one command in it, remove it: exits with the command's code (a CI step)")
     r.add_argument("image")
     r.add_argument("command", nargs="+", help="joined with spaces and run by `sh -c`; put it after --")
+    r.add_argument("--host", help="docker host, e.g. ssh://user@vm (default: local docker / $DOCKER_HOST)")
     r.add_argument("--cpus", type=float, default=2.0)
     r.add_argument("--memory", default="2g")
     r.add_argument("--pids", type=int, default=512)
@@ -108,8 +109,9 @@ def _run(p, a):
             p.error(f"--inject {spec!r}: ${var} is not set")
         inject.setdefault(host, {})[header] = os.environ[var]
     try:
-        with create_sandbox(a.image, limits=Limits(cpus=a.cpus, memory=a.memory, pids=a.pids),
-                            egress=a.egress or None, inject=inject or None) as sb:
+        # lifetime: if this process is killed (a cancelled job) the sandbox still removes itself, on a VM that outlives the job
+        with create_sandbox(a.image, host=a.host, limits=Limits(cpus=a.cpus, memory=a.memory, pids=a.pids),
+                            egress=a.egress or None, inject=inject or None, lifetime=a.timeout + 300) as sb:
             for spec in a.put:
                 local, _, remote = spec.rpartition(":")
                 sb.put_dir(local, remote)

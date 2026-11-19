@@ -410,6 +410,42 @@ Inputs: `image` and `run` (required), `workspace` (default `.`, `""` for none), 
 - `ubuntu-latest` only: the runner needs `sudo` and docker. `runsc` is pinned in `action.yml`.
 - `.github/workflows/ci.yml` runs the action on every PR (job `action`): the allowlist, the injected credential, the file copy in and out.
 
+### On your own machine instead of GitHub's
+
+Any repository can use the action (this one is public); the sandbox just has to run on a machine that has docker and `runsc` set up as in [Host setup](#host-setup-linux-vm-or-server). Two ways:
+
+**1. A self-hosted runner on that machine** (simplest). [Register the VM as a runner](https://docs.github.com/en/actions/hosting-your-own-runners) with a label, put its user in the `docker` group, and point the job at it:
+
+```yaml
+jobs:
+  agent:
+    runs-on: [self-hosted, gvisor]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cr-sbarbouche/agvisor@main
+        with: {image: "python:3.12-slim", run: "python agent.py"}
+```
+
+The `runsc` install step is skipped when docker already has the runtime. The runner also needs `python3-venv`. Only the `run:` script is sandboxed: checkout and the other steps run on the machine itself, so don't take pull requests from forks on a persistent runner (GitHub's own advice for self-hosted runners).
+
+**2. A GitHub-hosted (or any) runner that drives the machine over ssh**, with `host:`. Only the sandbox runs on your VM, and the runner stays disposable:
+
+```yaml
+    steps:
+      - uses: actions/checkout@v7
+      - run: |
+          install -m 700 -d ~/.ssh
+          echo "$SSH_KEY" > ~/.ssh/id_ed25519 && chmod 600 ~/.ssh/id_ed25519
+          echo "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+        env: {SSH_KEY: "${{ secrets.VM_SSH_KEY }}", SSH_KNOWN_HOSTS: "${{ vars.VM_KNOWN_HOSTS }}"}
+      - uses: cr-sbarbouche/agvisor@main
+        with: {host: "ssh://ci@vm.example.com", image: "python:3.12-slim", run: "python agent.py"}
+```
+
+The machine must be reachable from the runner. **Whoever holds that ssh key can run docker on the VM, which is root there**: give it a VM of its own and a key used for nothing else, and keep ssh off the open internet (GitHub's runner address ranges are large and public, so a VPN or tailnet that the job joins first is the safer way in).
+
+Either way: the sandbox removes itself `timeout` + 5 minutes after it started even if the runner dies mid-job (`agvisor prune` clears a leftover egress proxy), every sandbox gets its own network when `egress`/`inject` is set (about 30 at once, see `egress=`), and nothing the job leaves behind is on the machine except docker's cached images. Don't use a machine that serves something else: a sandbox on `bridge` (no `egress`) can reach whatever the host's network can.
+
 ## Security
 
 **This is alpha software and nobody has audited it.** gVisor shrinks the part of the kernel that sandboxed code can reach; it is not a guarantee, and this library's own code has not been reviewed for flaws. Don't use it as the boundary for hostile multi-tenant workloads without a review of your own, and keep `runsc` up to date (tested with release-20261026.0). Known gaps:

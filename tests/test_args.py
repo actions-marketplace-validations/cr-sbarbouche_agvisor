@@ -1405,14 +1405,14 @@ def test_cli():
                 raise RuntimeError("not a directory")
 
     def create(image, **kw):
-        log.append(("create", image, kw["limits"].memory, kw["egress"], kw["inject"]))
+        log.append(("create", image, kw["limits"].memory, kw["egress"], kw["inject"], kw["host"], kw["lifetime"]))
         return Box(rc=7 if image == "failing" else 0)
 
     with mock.patch("agvisor.cli.create_sandbox", create), mock.patch.dict(os.environ, {"TOK": "Bearer s3"}):
         rc, out = main("run", "img", "--memory", "1g", "--egress", "pypi.org", "--inject", "api.x.com:Authorization=TOK",
-                       "--put", ".:/workspace", "--get", "/workspace/out:out", "--timeout", "9", "--", "echo", "hi")
+                       "--put", ".:/workspace", "--get", "/workspace/out:out", "--timeout", "9", "--host", "ssh://ci@vm", "--", "echo", "hi")
         assert (rc, out) == (0, "hello\n")
-        assert log == [("create", "img", "1g", ["pypi.org"], {"api.x.com": {"Authorization": "Bearer s3"}}),
+        assert log == [("create", "img", "1g", ["pypi.org"], {"api.x.com": {"Authorization": "Bearer s3"}}, "ssh://ci@vm", 309),
                        ("put_dir", ".", "/workspace"), ("exec", "echo hi", 9), ("get_dir", "/workspace/out", "out"), "stop"]
         log.clear()
         assert main("run", "failing", "--get", "/missing:o", "--", "false")[0] == 7  # its code, and a missing output doesn't hide it
