@@ -1,4 +1,4 @@
-name: agvisor
+name: agvisor sandbox
 description: Run a command in a gVisor sandbox with CPU/RAM limits, an outbound allowlist, and credentials it can use but not read
 branding:
   icon: shield
