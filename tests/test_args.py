@@ -1378,6 +1378,48 @@ def test_cli():
         assert main("get", "agvisor-old", "/w/dir", str(Path(d, "o")))[0] == 0 and seen[-1] == ("get_dir", "/w/dir", {})
         assert main("get", "agvisor-old", "/missing", str(out))[0] == 2  # the sandbox's error becomes a usage error
 
+    # `run`: a fresh sandbox, one command, the command's exit code, the sandbox always removed
+    log = []
+
+    class Box:
+        def __init__(self, rc=0):
+            self.rc = rc
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            log.append("stop")
+
+        def put_dir(self, local, remote):
+            log.append(("put_dir", local, remote))
+
+        def exec(self, cmd, timeout, on_output):
+            on_output("hello\n")
+            log.append(("exec", cmd, timeout))
+            return subprocess.CompletedProcess([], self.rc, "", "")
+
+        def get_dir(self, remote, local):
+            log.append(("get_dir", remote, local))
+            if remote == "/missing":
+                raise RuntimeError("not a directory")
+
+    def create(image, **kw):
+        log.append(("create", image, kw["limits"].memory, kw["egress"], kw["inject"]))
+        return Box(rc=7 if image == "failing" else 0)
+
+    with mock.patch("agvisor.cli.create_sandbox", create), mock.patch.dict(os.environ, {"TOK": "Bearer s3"}):
+        rc, out = main("run", "img", "--memory", "1g", "--egress", "pypi.org", "--inject", "api.x.com:Authorization=TOK",
+                       "--put", ".:/workspace", "--get", "/workspace/out:out", "--timeout", "9", "--", "echo", "hi")
+        assert (rc, out) == (0, "hello\n")
+        assert log == [("create", "img", "1g", ["pypi.org"], {"api.x.com": {"Authorization": "Bearer s3"}}),
+                       ("put_dir", ".", "/workspace"), ("exec", "echo hi", 9), ("get_dir", "/workspace/out", "out"), "stop"]
+        log.clear()
+        assert main("run", "failing", "--get", "/missing:o", "--", "false")[0] == 7  # its code, and a missing output doesn't hide it
+        assert log[-1] == "stop"
+        assert main("run", "img", "--inject", "api.x.com:Authorization=NOPE", "--", "x")[0] == 2  # unset variable: usage error
+        assert main("run", "img", "--inject", "api.x.com", "--", "x")[0] == 2
+
 
 def test_mcp_server():
     from agvisor import mcp_server as m

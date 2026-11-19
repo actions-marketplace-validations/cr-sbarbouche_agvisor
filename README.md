@@ -378,6 +378,38 @@ A new `token` reconnects. The element fires an `error` event (`e.detail` = messa
 A token only has to be valid when the session *opens*, but anyone holding it can open one until `ttl` runs out.
 In `web/`: `npm test` checks the token round trip against the real gateway with a fake guacd; `npm run test:browser` runs the component in real Chrome (render, mouse, keyboard, resize, errors, cleanup).
 
+## GitHub Action
+
+Run an agent, a test suite or any untrusted step in a gVisor sandbox on a GitHub-hosted `ubuntu-latest` runner. The action installs `runsc`, copies the job's files into `/workspace`, runs your script there and fails the step with the script's exit code.
+
+```yaml
+- uses: actions/checkout@v7
+- uses: cr-sbarbouche/agvisor@main   # pin a release tag or a commit once one has action.yml
+  env:
+    ANTHROPIC_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+  with:
+    image: python:3.12-slim
+    egress: |
+      pypi.org
+      files.pythonhosted.org
+    inject: api.anthropic.com:x-api-key=ANTHROPIC_KEY   # the script can call the API; it never holds the key
+    output: /workspace/out                              # copied to ./agvisor-out, even if the script fails
+    run: |
+      pip install -r requirements.txt
+      python agent.py
+- uses: actions/upload-artifact@v5
+  if: always()
+  with: {name: agent-out, path: agvisor-out}
+```
+
+Inputs: `image` and `run` (required), `workspace` (default `.`, `""` for none), `output`, `egress`, `inject`, `cpus` (2), `memory` (2g), `timeout` (600 s). With no `egress` the network is open, as with `create_sandbox()`. Under the hood it is `agvisor run IMAGE --egress ... --inject HOST:HEADER=ENVVAR --put ... --get ... -- COMMAND`, which also works on any machine with docker and `runsc`.
+
+- The secret goes in the calling step's `env:` and `inject:` names the variable, so it never appears on a command line and the sandbox never holds it (see [credentials the sandbox can use but not read](#credentials-the-sandbox-can-use-but-not-read)).
+- The `workspace` copy is a tar through `docker exec`: a repository with large binaries makes it slow. The image must be Debian/Ubuntu-based (GNU `timeout` and `tar`).
+- Headless only: no GNOME desktop (the image is 7.6 GB). A headless browser works ([A browser inside](#a-browser-inside)).
+- `ubuntu-latest` only: the runner needs `sudo` and docker. `runsc` is pinned in `action.yml`.
+- `.github/workflows/ci.yml` runs the action on every PR (job `action`): the allowlist, the injected credential, the file copy in and out.
+
 ## Security
 
 **This is alpha software and nobody has audited it.** gVisor shrinks the part of the kernel that sandboxed code can reach; it is not a guarantee, and this library's own code has not been reviewed for flaws. Don't use it as the boundary for hostile multi-tenant workloads without a review of your own, and keep `runsc` up to date (tested with release-20261026.0). Known gaps:
