@@ -1,0 +1,91 @@
+name: agvisor
+description: Run a command in a gVisor sandbox, with CPU/RAM limits, an outbound allowlist, and credentials the command can use but not read
+branding:
+  icon: shield
+  color: gray-dark
+
+inputs:
+  image:
+    description: "Docker image to run the command in (a Debian/Ubuntu-based one: exec needs GNU timeout and tar)"
+    required: true
+  run:
+    description: Shell script to run inside, from /workspace
+    required: true
+  workspace:
+    description: Directory of this job copied into /workspace first ("" for none)
+    default: .
+  output:
+    description: Directory inside the sandbox copied to ./agvisor-out afterwards, even if the script failed (e.g. /workspace/out)
+    default: ""
+  egress:
+    description: Hosts the script may reach, one per line (pypi.org, *.github.com, 10.0.0.5:8080). Empty = open network
+    default: ""
+  inject:
+    description: |
+      Credentials the script can use but never holds, one per line as HOST:HEADER=ENVVAR. The value is $ENVVAR of the
+      calling step (put the secret in that step's `env:`); the proxy adds the header to HTTPS requests to HOST.
+    default: ""
+  host:
+    description: "Docker host to run the sandbox on instead of this machine, e.g. ssh://ci@vm (the ssh key is set up by an earlier step)"
+    default: ""
+  cpus:
+    description: CPU cores
+    default: "2"
+  memory:
+    description: RAM cap ("512m", "4g")
+    default: 2g
+  timeout:
+    description: Seconds the script may run
+    default: "600"
+
+runs:
+  using: composite
+  steps:
+    # ponytail: the same pinned release as the gvisor job in ci.yml (Dependabot can't see it): bump both by hand.
+    - name: install gVisor and register it as the docker runtime "runsc"
+      if: inputs.host == ''  # a remote host has its own runsc (see the README's host setup)
+      shell: bash
+      env:
+        GVISOR_RELEASE: "20261026.0"
+        GVISOR_SHA512: e6aa030fb8379fe92b53e9b8b696419e0dce8a3bbcc7d4c1cf76b2ea3d6569eabd7360e694deda6ccbdcd77095b3e82ca0f90a3d8fd13a3e5d6b11cd29fe4649
+      run: |
+        if docker info --format '{{json .Runtimes}}' | grep -q '"runsc"'; then exit 0; fi
+        curl -fsSL -o "$RUNNER_TEMP/gvisor.tar.zstd" "https://storage.googleapis.com/gvisor/releases/release/$GVISOR_RELEASE/x86_64/gvisor.tar.zstd"
+        echo "$GVISOR_SHA512  $RUNNER_TEMP/gvisor.tar.zstd" | sha512sum -c -
+        mkdir "$RUNNER_TEMP/gvisor"
+        tar --zstd -xf "$RUNNER_TEMP/gvisor.tar.zstd" -C "$RUNNER_TEMP/gvisor"
+        sudo cp -r "$RUNNER_TEMP"/gvisor/* /usr/local/bin/
+        sudo runsc install
+        sudo systemctl restart docker
+        docker info --format '{{json .Runtimes}}' | grep -q '"runsc"'
+
+    - name: install agvisor
+      shell: bash
+      run: |
+        python3 -m venv "$RUNNER_TEMP/agvisor-venv"
+        "$RUNNER_TEMP/agvisor-venv/bin/pip" install -q "$GITHUB_ACTION_PATH[inject]"
+
+    - name: run in the sandbox
+      shell: bash
+      # inputs go through env, never interpolated into the script: a value can't become shell syntax
+      env:
+        HOST: ${{ inputs.host }}
+        IMAGE: ${{ inputs.image }}
+        SCRIPT: ${{ inputs.run }}
+        WORKSPACE: ${{ inputs.workspace }}
+        OUTPUT: ${{ inputs.output }}
+        EGRESS: ${{ inputs.egress }}
+        INJECT: ${{ inputs.inject }}
+        CPUS: ${{ inputs.cpus }}
+        MEMORY: ${{ inputs.memory }}
+        TIMEOUT: ${{ inputs.timeout }}
+      run: |
+        args=(--cpus "$CPUS" --memory "$MEMORY" --timeout "$TIMEOUT")
+        while IFS= read -r l; do [ -n "$l" ] && args+=(--egress "$l"); done <<< "$EGRESS"
+        while IFS= read -r l; do [ -n "$l" ] && args+=(--inject "$l"); done <<< "$INJECT"
+        [ -n "$HOST" ] && args+=(--host "$HOST")
+        [ -n "$WORKSPACE" ] && args+=(--put "$WORKSPACE:/workspace")
+        [ -n "$OUTPUT" ] && args+=(--get "$OUTPUT:agvisor-out")
+        # the sandbox's first lines: stop on the first failure, like a `run:` step does
+        "$RUNNER_TEMP/agvisor-venv/bin/agvisor" run "$IMAGE" "${args[@]}" -- "set -e; mkdir -p /workspace; cd /workspace
+        $SCRIPT"

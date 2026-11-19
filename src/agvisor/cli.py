@@ -1,12 +1,14 @@
-"""agvisor ls | rm | prune | exec | put | get: look at, clean up, poke and feed the sandboxes on a docker host."""
+"""agvisor ls | rm | prune | exec | put | get | run: look at, clean up, poke and feed the sandboxes on a docker host, or run one command in a fresh one."""
 import argparse
+import os
 import shlex
 import sys
 import tarfile
 from pathlib import Path
 from datetime import datetime, timezone
 
-from .sandbox import SandboxGone, list_sandboxes, prune_egress
+from .limits import Limits
+from .sandbox import SandboxGone, create_sandbox, list_sandboxes, prune_egress
 
 
 def main(argv=None):
@@ -34,8 +36,23 @@ def main(argv=None):
     get.add_argument("remote")
     get.add_argument("local", help="a file or a directory here (replaced / merged into)")
     get.add_argument("--max-bytes", type=int, help="refuse more than this (default 10 MB for a file, 50 MB for a directory)")
+    r = sub.add_parser("run", help="make a sandbox, run one command in it, remove it: exits with the command's code (a CI step)")
+    r.add_argument("image")
+    r.add_argument("command", nargs="+", help="joined with spaces and run by `sh -c`; put it after --")
+    r.add_argument("--host", help="docker host, e.g. ssh://user@vm (default: local docker / $DOCKER_HOST)")
+    r.add_argument("--cpus", type=float, default=2.0)
+    r.add_argument("--memory", default="2g")
+    r.add_argument("--pids", type=int, default=512)
+    r.add_argument("--timeout", type=int, default=600, help="seconds for the command")
+    r.add_argument("--egress", action="append", default=[], metavar="HOST", help="allowlist entry, repeatable; none = open network")
+    r.add_argument("--inject", action="append", default=[], metavar="HOST:HEADER=ENVVAR",
+                   help="send HEADER to HOST with the value of $ENVVAR, which the sandbox never sees; repeatable")
+    r.add_argument("--put", action="append", default=[], metavar="LOCAL:REMOTE", help="copy a local directory in before the command")
+    r.add_argument("--get", action="append", default=[], metavar="REMOTE:LOCAL", help="copy a directory out after it, even if it failed")
     a = p.parse_args(argv)
 
+    if a.cmd == "run":
+        return _run(p, a)
     if a.cmd == "prune":
         prune_egress(a.host)
         return 0
@@ -79,3 +96,32 @@ def main(argv=None):
         p.error(str(e))
     print("done")
     return 0
+
+
+def _run(p, a):
+    inject = {}
+    for spec in a.inject:  # the value comes from the environment: a secret on a command line shows up in `ps` and in logs
+        host, _, rest = spec.partition(":")
+        header, _, var = rest.partition("=")
+        if not (host and header and var):
+            p.error(f"--inject {spec!r}: expected HOST:HEADER=ENVVAR")
+        if var not in os.environ:
+            p.error(f"--inject {spec!r}: ${var} is not set")
+        inject.setdefault(host, {})[header] = os.environ[var]
+    try:
+        # lifetime: if this process is killed (a cancelled job) the sandbox still removes itself, on a VM that outlives the job
+        with create_sandbox(a.image, host=a.host, limits=Limits(cpus=a.cpus, memory=a.memory, pids=a.pids),
+                            egress=a.egress or None, inject=inject or None, lifetime=a.timeout + 300) as sb:
+            for spec in a.put:
+                local, _, remote = spec.rpartition(":")
+                sb.put_dir(local, remote)
+            rc = sb.exec(" ".join(a.command), timeout=a.timeout, on_output=lambda t: print(t, end="", flush=True)).returncode
+            for spec in a.get:  # a failed run's output is the one you want most; a missing directory doesn't change its code
+                remote, _, local = spec.partition(":")
+                try:
+                    sb.get_dir(remote, local)
+                except (SandboxGone, RuntimeError, ValueError, OSError, tarfile.TarError) as e:
+                    print(f"agvisor: could not copy {remote} out: {e}", file=sys.stderr)
+            return rc
+    except (SandboxGone, RuntimeError, ValueError, OSError, tarfile.TarError) as e:
+        p.error(str(e))

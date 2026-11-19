@@ -378,6 +378,74 @@ A new `token` reconnects. The element fires an `error` event (`e.detail` = messa
 A token only has to be valid when the session *opens*, but anyone holding it can open one until `ttl` runs out.
 In `web/`: `npm test` checks the token round trip against the real gateway with a fake guacd; `npm run test:browser` runs the component in real Chrome (render, mouse, keyboard, resize, errors, cleanup).
 
+## GitHub Action
+
+Run an agent, a test suite or any untrusted step in a gVisor sandbox on a GitHub-hosted `ubuntu-latest` runner. The action installs `runsc`, copies the job's files into `/workspace`, runs your script there and fails the step with the script's exit code.
+
+```yaml
+- uses: actions/checkout@v7
+- uses: cr-sbarbouche/agvisor@main   # pin a release tag or a commit once one has action.yml
+  env:
+    ANTHROPIC_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+  with:
+    image: python:3.12-slim
+    egress: |
+      pypi.org
+      files.pythonhosted.org
+    inject: api.anthropic.com:x-api-key=ANTHROPIC_KEY   # the script can call the API; it never holds the key
+    output: /workspace/out                              # copied to ./agvisor-out, even if the script fails
+    run: |
+      pip install -r requirements.txt
+      python agent.py
+- uses: actions/upload-artifact@v5
+  if: always()
+  with: {name: agent-out, path: agvisor-out}
+```
+
+Inputs: `image` and `run` (required), `workspace` (default `.`, `""` for none), `output`, `egress`, `inject`, `cpus` (2), `memory` (2g), `timeout` (600 s). With no `egress` the network is open, as with `create_sandbox()`. Under the hood it is `agvisor run IMAGE --egress ... --inject HOST:HEADER=ENVVAR --put ... --get ... -- COMMAND`, which also works on any machine with docker and `runsc`.
+
+- The secret goes in the calling step's `env:` and `inject:` names the variable, so it never appears on a command line and the sandbox never holds it (see [credentials the sandbox can use but not read](#credentials-the-sandbox-can-use-but-not-read)).
+- The `workspace` copy is a tar through `docker exec`: a repository with large binaries makes it slow. The image must be Debian/Ubuntu-based (GNU `timeout` and `tar`).
+- Headless only: no GNOME desktop (the image is 7.6 GB). A headless browser works ([A browser inside](#a-browser-inside)).
+- `ubuntu-latest` only: the runner needs `sudo` and docker. `runsc` is pinned in `action.yml`.
+- `.github/workflows/ci.yml` runs the action on every PR (job `action`): the allowlist, the injected credential, the file copy in and out.
+
+### On your own machine instead of GitHub's
+
+Any repository can use the action (this one is public); the sandbox just has to run on a machine that has docker and `runsc` set up as in [Host setup](#host-setup-linux-vm-or-server). Two ways:
+
+**1. A self-hosted runner on that machine** (simplest). [Register the VM as a runner](https://docs.github.com/en/actions/hosting-your-own-runners) with a label, put its user in the `docker` group, and point the job at it:
+
+```yaml
+jobs:
+  agent:
+    runs-on: [self-hosted, gvisor]
+    steps:
+      - uses: actions/checkout@v7
+      - uses: cr-sbarbouche/agvisor@main
+        with: {image: "python:3.12-slim", run: "python agent.py"}
+```
+
+The `runsc` install step is skipped when docker already has the runtime. The runner also needs `python3-venv`. Only the `run:` script is sandboxed: checkout and the other steps run on the machine itself, so don't take pull requests from forks on a persistent runner (GitHub's own advice for self-hosted runners).
+
+**2. A GitHub-hosted (or any) runner that drives the machine over ssh**, with `host:`. Only the sandbox runs on your VM, and the runner stays disposable:
+
+```yaml
+    steps:
+      - uses: actions/checkout@v7
+      - run: |
+          install -m 700 -d ~/.ssh
+          echo "$SSH_KEY" > ~/.ssh/id_ed25519 && chmod 600 ~/.ssh/id_ed25519
+          echo "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
+        env: {SSH_KEY: "${{ secrets.VM_SSH_KEY }}", SSH_KNOWN_HOSTS: "${{ vars.VM_KNOWN_HOSTS }}"}
+      - uses: cr-sbarbouche/agvisor@main
+        with: {host: "ssh://ci@vm.example.com", image: "python:3.12-slim", run: "python agent.py"}
+```
+
+The machine must be reachable from the runner. **Whoever holds that ssh key can run docker on the VM, which is root there**: give it a VM of its own and a key used for nothing else, and keep ssh off the open internet (GitHub's runner address ranges are large and public, so a VPN or tailnet that the job joins first is the safer way in).
+
+Either way: the sandbox removes itself `timeout` + 5 minutes after it started even if the runner dies mid-job (`agvisor prune` clears a leftover egress proxy), every sandbox gets its own network when `egress`/`inject` is set (about 30 at once, see `egress=`), and nothing the job leaves behind is on the machine except docker's cached images. Don't use a machine that serves something else: a sandbox on `bridge` (no `egress`) can reach whatever the host's network can.
+
 ## Security
 
 **This is alpha software and nobody has audited it.** gVisor shrinks the part of the kernel that sandboxed code can reach; it is not a guarantee, and this library's own code has not been reviewed for flaws. Don't use it as the boundary for hostile multi-tenant workloads without a review of your own, and keep `runsc` up to date (tested with release-20261026.0). Known gaps:

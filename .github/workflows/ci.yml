@@ -162,3 +162,38 @@ jobs:
         env:
           AGVISOR_IMAGE: python:3.12-slim
         run: uv run --locked --extra inject --extra mcp python tests/test_inject_mcp_stdio.py
+
+  action: # action.yml used the way a project would use it: `uses: ./` from a checkout
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: ./
+        env:
+          FAKE_KEY: not-a-real-key-s3cret # the credential a project would take from `secrets.`
+        with:
+          image: python:3.12-slim
+          egress: pypi.org
+          inject: api.anthropic.com:x-api-key=FAKE_KEY
+          output: /workspace/out
+          run: |
+            test -f pyproject.toml                  # the job's files are in /workspace
+            ! env | grep -q s3cret                  # the credential is not in the sandbox
+            python - <<'PY'
+            import urllib.error, urllib.request as u
+            u.urlopen("https://pypi.org", timeout=30)  # on the allowlist
+            try:
+                u.urlopen("https://example.com", timeout=30)
+                raise SystemExit("example.com got through the allowlist")
+            except urllib.error.URLError:
+                pass
+            try:
+                u.urlopen("https://api.anthropic.com/v1/models", timeout=30)
+            except urllib.error.HTTPError as e:  # 401 either way: the body says whether a key arrived
+                body = e.read().decode()
+                assert "invalid x-api-key" in body, body
+            PY
+            mkdir -p out && echo ok > out/r.txt
+      - run: test "$(cat agvisor-out/r.txt)" = ok # the output directory came back
