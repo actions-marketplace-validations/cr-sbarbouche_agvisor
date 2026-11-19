@@ -384,7 +384,7 @@ Run an agent, a test suite or any untrusted step in a gVisor sandbox on a GitHub
 
 ```yaml
 - uses: actions/checkout@v7
-- uses: cr-sbarbouche/agvisor@main   # pin a release tag or a commit once one has action.yml
+- uses: cr-sbarbouche/agvisor@v0.1.8
   env:
     ANTHROPIC_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
   with:
@@ -422,7 +422,7 @@ jobs:
     runs-on: [self-hosted, gvisor]
     steps:
       - uses: actions/checkout@v7
-      - uses: cr-sbarbouche/agvisor@main
+      - uses: cr-sbarbouche/agvisor@v0.1.8
         with: {image: "python:3.12-slim", run: "python agent.py"}
 ```
 
@@ -438,7 +438,7 @@ The `runsc` install step is skipped when docker already has the runtime. The run
           echo "$SSH_KEY" > ~/.ssh/id_ed25519 && chmod 600 ~/.ssh/id_ed25519
           echo "$SSH_KNOWN_HOSTS" > ~/.ssh/known_hosts
         env: {SSH_KEY: "${{ secrets.VM_SSH_KEY }}", SSH_KNOWN_HOSTS: "${{ vars.VM_KNOWN_HOSTS }}"}
-      - uses: cr-sbarbouche/agvisor@main
+      - uses: cr-sbarbouche/agvisor@v0.1.8
         with: {host: "ssh://ci@vm.example.com", image: "python:3.12-slim", run: "python agent.py"}
 ```
 
