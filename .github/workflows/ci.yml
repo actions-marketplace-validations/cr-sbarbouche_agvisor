@@ -94,7 +94,7 @@ jobs:
       - name: snyk test (runtime deps + the web and mcp extras, as locked)
         run: |
           uv export --locked --no-dev --extra web --extra mcp --no-emit-project --no-hashes -o requirements.txt
-          uv venv "$RUNNER_TEMP/venv"
+          uv venv --seed "$RUNNER_TEMP/venv"
           uv pip install --python "$RUNNER_TEMP/venv/bin/python" -r requirements.txt --no-deps
           npx "snyk@$SNYK_VERSION" test --file=requirements.txt --command="$RUNNER_TEMP/venv/bin/python" --severity-threshold=high
       - name: snyk test (the browser component and the gateway)
