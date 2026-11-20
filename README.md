@@ -464,7 +464,7 @@ To report a vulnerability, email sadokbarbouche1@outlook.com instead of opening 
 ## CI and dependency updates
 
 - `.github/workflows/ci.yml` runs on every PR, every push to `main`, and weekly (new advisories appear without commits):
-  `test` (Python tests, the gateway token round trip, and the component in real Chrome), `audit` (`pip-audit` on the locked Python deps, `npm audit` + registry-signature check on `web/`), `semgrep` (code scan of the Python, the JS and the workflows).
+  `test` (Python tests, the gateway token round trip, and the component in real Chrome), `audit` (`pip-audit` on the locked Python deps, `npm audit` + registry-signature check on `web/`), `semgrep` (code scan of the Python, the JS and the workflows), `snyk` (the same dependency check against Snyk's database; only on `main` and the weekly run, to stay inside the free tier's test quota; needs the `SNYK_TOKEN` repo secret).
 - `.github/dependabot.yml` opens weekly update PRs for `uv`, `npm` and the GitHub Actions themselves (minor+patch grouped, 7-day cooldown). Those PRs run the same checks.
 - `.github/workflows/publish-npm.yml` publishes `web/` (`agvisor-desktop`) to npm with Trusted Publishing: push a tag `web-vX.Y.Z` that equals the version in `web/package.json` and is on `main`. Run by hand, it only builds, tests and lists the package. Setup steps are at the top of the file.
 - Not configurable from a workflow, set these in the repo settings: make `test`, `audit` and `semgrep` required checks on `main`, and turn on Dependabot alerts.

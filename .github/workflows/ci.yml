@@ -16,10 +16,11 @@ concurrency:
   cancel-in-progress: true
 
 # Third-party actions are pinned to a commit SHA (a tag can be moved); Dependabot keeps them current.
-# ponytail: the two scanners below are pinned inline, so Dependabot can't bump them: update by hand.
+# ponytail: the three scanners below are pinned inline, so Dependabot can't bump them: update by hand.
 env:
   PIP_AUDIT_VERSION: "2.10.1"
   SEMGREP_VERSION: "1.183.0"
+  SNYK_VERSION: "1.1309.0"
 
 jobs:
   test:
@@ -71,6 +72,35 @@ jobs:
         run: |
           for dir in web gateway; do
             (cd "$dir" && npm ci --ignore-scripts && npm audit && npm audit signatures)
+          done
+
+  snyk: # the same question as audit, answered from Snyk's own database
+    # ponytail: free tier (about 200 Open Source tests a month, 3 per run): main and the weekly cron only, never PRs.
+    # Upgrade path if that is too few: osv-scanner (no quota), or a paid plan. Needs the SNYK_TOKEN repo secret.
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    env:
+      SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@68559e99cc807c1eb7e9238fd43a15bba460eec2 # v10.3.3
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 24
+      # Snyk resolves pip deps from an installed environment, so install the locked set (no resolving, --no-deps) into a venv.
+      - name: snyk test (runtime deps + the web and mcp extras, as locked)
+        run: |
+          uv export --locked --no-dev --extra web --extra mcp --no-emit-project --no-hashes -o requirements.txt
+          uv venv "$RUNNER_TEMP/venv"
+          uv pip install --python "$RUNNER_TEMP/venv/bin/python" -r requirements.txt --no-deps
+          npx "snyk@$SNYK_VERSION" test --file=requirements.txt --command="$RUNNER_TEMP/venv/bin/python" --severity-threshold=high
+      - name: snyk test (the browser component and the gateway)
+        run: |
+          for dir in web gateway; do
+            (cd "$dir" && npm ci --ignore-scripts && npx "snyk@$SNYK_VERSION" test --severity-threshold=high)
           done
 
   semgrep: # vulnerable code patterns in the Python, JS and the workflows themselves
