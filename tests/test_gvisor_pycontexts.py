@@ -12,7 +12,7 @@ host, image = os.environ.get("AGVISOR_HOST"), os.environ.get("AGVISOR_IMAGE")
 
 
 def servers(sb):  # the interpreters that are up: each has a pid file in its own directory
-    r = sb.exec("for f in /var/tmp/.agvisor-py*/pid; do [ -f $f ] && kill -0 $(cat $f) 2>/dev/null && echo up; done | wc -l")
+    r = sb.exec("for f in /var/tmp/.agvisor-py*/pid; do [ -f $f ] && kill -0 $(cat $f) 2>/dev/null && echo up; done | wc -l", timeout=30)  # under idle_ttl
     return int(r.stdout)
 
 
@@ -45,7 +45,7 @@ with create_sandbox(image, host=host, idle_ttl=120, lifetime=600) as sb:
         except ValueError:
             continue
         raise AssertionError(f"accepted {bad!r}")
-    assert sb.exec("test ! -e /tmp/pwned").returncode == 0
+    assert sb.exec("test ! -e /tmp/pwned", timeout=30).returncode == 0
 
 # the MCP tool, with a context
 os.environ.update(AGVISOR_NETWORK="none", AGVISOR_IDLE_TTL="120", AGVISOR_LIFETIME="600")

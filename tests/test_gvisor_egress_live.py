@@ -15,7 +15,7 @@ from agvisor import cli, create_sandbox
 host, image = os.environ.get("AGVISOR_HOST"), os.environ.get("AGVISOR_IMAGE")
 FETCH = ("import urllib.request as u, urllib.error as e\n"
          "try: print(u.urlopen({!r}, timeout=20).status)\n"
-         "except e.HTTPError as x: print(x.code)\n"  # plain http: the proxy's own 403
+         "except e.HTTPError as x: print(x.code, x.read().decode()[:120])\n"  # plain http: the proxy's own 403 says "agvisor egress: ..."
          "except Exception as x: print('error', x)")  # https: "Tunnel connection failed: 403 Forbidden"
 
 
@@ -23,8 +23,15 @@ def status(sb, url):
     return sb.exec(f"python3 -c {shlex.quote(FETCH.format(url))}", timeout=60).stdout.strip()
 
 
-def refused(sb, url):
-    return "403" in status(sb, url)
+def refused(sb, url):  # the proxy said no (not the site: example.org may answer 403 to a client it doesn't like)
+    out = status(sb, url)
+    return "agvisor egress" in out or "Tunnel connection failed: 403" in out
+
+
+def reached(sb, url):  # the request went through to the site, whatever the site then said
+    out = status(sb, url)
+    assert not refused(sb, url) and not out.startswith("error"), f"{url}: {out}"
+    return True
 
 
 def until(cond, what, seconds=20):
@@ -51,7 +58,7 @@ with create_sandbox(image, host=host, egress=["example.com"], lifetime=900) as s
 # 2. '!' carves a name out of a wildcard; deny() takes effect on new connections at once; allow() undoes it
 with create_sandbox(image, host=host, egress=["example.com", "*.example.org", "!www.example.org"], lifetime=900) as sb:
     assert sb.egress_rules() == ["example.com", "*.example.org", "!www.example.org"]
-    assert status(sb, "https://example.com/") == "200"
+    assert reached(sb, "https://example.com/")
     assert refused(sb, "https://www.example.org/")  # the wildcard allows it, the deny wins
     assert refused(sb, "https://example.org/")  # `*.example.org` is not example.org itself
     assert refused(sb, "http://www.example.org:80/")  # whatever the port
@@ -59,7 +66,7 @@ with create_sandbox(image, host=host, egress=["example.com", "*.example.org", "!
 
     sb.allow("example.org", "www.example.org")  # un-denies the first
     assert sb.egress_rules() == ["example.com", "*.example.org", "example.org", "www.example.org"]
-    assert status(sb, "https://www.example.org/") == "200" and status(sb, "https://example.org/") == "200"
+    assert reached(sb, "https://www.example.org/") and reached(sb, "https://example.org/")
     assert sb.egress_denied() == []
 
     sb.deny("example.com")
@@ -92,7 +99,7 @@ except OSError as e:
 
     # 3. the CLI does the same on the running sandbox, from another process
     name, extra = sb.name, (["--host", host] if host else [])
-    assert cli.main(["allow", name, "example.com", *extra]) == 0 and status(sb, "https://example.com/") == "200"
+    assert cli.main(["allow", name, "example.com", *extra]) == 0 and reached(sb, "https://example.com/")
     assert cli.main(["deny", name, "example.com", *extra]) == 0 and refused(sb, "https://example.com/")
     assert cli.main(["egress", name, *extra]) == 0 and cli.main(["egress", name, "--denied", *extra]) == 0
     for bad in (["allow", name, "not an entry", *extra], ["allow", name, "x.org:0", *extra]):
@@ -123,7 +130,8 @@ try:
     name = m._sb.name
     assert cli.main(["allow", name, "example.org", *extra]) == 0  # the user, from a shell
     assert m.egress_blocked() == "nothing was refused"
-    assert m.run(f"python3 -c {shlex.quote(FETCH.format('https://example.org/'))}").startswith("200")
+    out = m.run(f"python3 -c {shlex.quote(FETCH.format('https://example.org/'))}")
+    assert "Tunnel connection failed" not in out and "agvisor egress" not in out, out  # through the proxy now
 finally:
     m.reset()
 print("ok")

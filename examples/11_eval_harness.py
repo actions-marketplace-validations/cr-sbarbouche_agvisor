@@ -21,12 +21,13 @@ TASKS = {
     "reverse": {"solution.py": "def rev(s):\n    return s\n", "check.py": "from solution import rev\nassert rev('abc') == 'cba'\n"},
     "fizz": {"solution.py": "def fizz(n):\n    return str(n)\n", "check.py": "from solution import fizz\nassert fizz(3) == 'Fizz' and fizz(5) == 'Buzz' and fizz(7) == '7'\n"},
 }
-# what the scripted agent writes; "fizz" is wrong on purpose, so the table has a failure in it
+# what the scripted agent writes; its "fizz" is incomplete on purpose (no Buzz), so the table has a failure in it
 FIXES = {
     "add": "def add(a, b):\n    return a + b\n",
     "reverse": "def rev(s):\n    return s[::-1]\n",
     "fizz": "def fizz(n):\n    return 'Fizz' if n % 3 == 0 else str(n)\n",
 }
+FIZZ_FIXED = "def fizz(n):\n    return 'Fizz' if n % 3 == 0 else 'Buzz' if n % 5 == 0 else str(n)\n"  # what the retry writes
 
 
 async def agent(sb, name):
@@ -66,15 +67,18 @@ with create_sandbox(IMAGE, host=HOST, name="eval-retry", network="none", lifetim
             sb.put(f"/workspace/{path}", text.encode())
         sb.snapshot("clean")
 
-        sb.put("/workspace/solution.py", b"def fizz(n):\n    return 'wrong'\n")  # attempt 1: gets it wrong, and litters the workspace
+        sb.put("/workspace/solution.py", FIXES["fizz"].encode())  # attempt 1: incomplete, and it litters the workspace
         sb.exec("echo junk > /workspace/notes.txt")
-        print("attempt 1:", "pass" if sb.exec("cd /workspace && python3 check.py").returncode == 0 else "FAIL")
+        first = sb.exec("cd /workspace && python3 check.py").returncode == 0
+        print("attempt 1:", "pass" if first else "FAIL")
 
         sb = sb.restore("clean")  # the workspace is exactly as it was before attempt 1; the sandbox is a fresh container
-        assert sb.exec("ls /workspace").stdout.split() == ["check.py", "solution.py"]
-        assert sb.get("/workspace/solution.py").decode() == files["solution.py"]
+        assert sb.exec("ls /workspace").stdout.split() == ["check.py", "solution.py"]  # the junk is gone
+        assert sb.get("/workspace/solution.py").decode() == files["solution.py"]  # and so is the attempt
 
-        sb.put("/workspace/solution.py", FIXES["fizz"].encode())  # attempt 2
-        print("attempt 2:", "pass" if sb.exec("cd /workspace && python3 check.py").returncode == 0 else "FAIL")
+        sb.put("/workspace/solution.py", FIZZ_FIXED.encode())  # attempt 2
+        second = sb.exec("cd /workspace && python3 check.py").returncode == 0
+        print("attempt 2:", "pass" if second else "FAIL")
+        assert not first and second
     finally:
         sb.delete()  # also erases the snapshot
