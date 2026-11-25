@@ -1,7 +1,7 @@
 # Examples
 
 Each script is self-contained and prints what it did. They need a docker host with gVisor registered as the `runsc` runtime
-(see [Host setup](../README.md#host-setup-linux-vm-or-server)) and `uv`:
+(see [Host setup](../README.md#host-setup-linux-vm-or-server)) and `uv` (`10_agent_cli.py` also wants `--extra inject`):
 
 ```sh
 uv run python examples/01_quickstart.py
@@ -19,6 +19,8 @@ AGVISOR_HOST=ssh://user@my-vm uv run python examples/01_quickstart.py   # docker
 | [`07_workspace_cap.py`](07_workspace_cap.py) | `Limits(workspace=...)`: a size cap on a named sandbox's `/workspace` (needs xfs with `pquota` on the host) |
 | [`08_browser.py`](08_browser.py) | a headless Chromium (Playwright) opens a page and takes a screenshot, behind gVisor |
 | [`09_browser_egress.py`](09_browser_egress.py) | the same browser behind `egress=`: the listed host loads, any other is refused |
+| [`10_agent_cli.py`](10_agent_cli.py) | Claude Code's CLI inside the sandbox: only npm and the API reachable, and the API key added by the proxy, never held by the agent (needs `agvisor[inject]`; `ANTHROPIC_API_KEY` to get an answer) |
+| [`11_eval_harness.py`](11_eval_harness.py) | one sandbox per trial: a warm `Pool`, tasks side by side under `asyncio`, a grading script inside, and `snapshot()`/`restore()` to retry from a clean workspace |
 
 CI runs every script against real gVisor (the `gvisor` job), so they are not allowed to rot.
 To give a coding agent a sandbox instead of calling the library yourself, see [Coding agents](../README.md#coding-agents-skill--mcp-server).

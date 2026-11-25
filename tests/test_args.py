@@ -952,7 +952,7 @@ def test_egress_proxy():
 def test_jobs():
     sb, calls, answers = Sandbox(idle_ttl=60), [], []
 
-    def fake_exec(cmd, *, timeout, on_output=None, input=None):
+    def fake_exec(cmd, *, timeout, on_output=None, input=None, env=None, cwd=None):
         calls.append((cmd, timeout))
         rc, out = answers.pop(0) if answers else (0, "")
         if on_output:
@@ -1691,10 +1691,10 @@ def test_mcp_python():
         def __init__(self):
             self.calls, self.rc, self.out, self.gone, self.stopped = [], 0, "42\n", False, False
 
-        def python(self, code, *, timeout, restart):
+        def python(self, code, *, timeout, restart, context=None):
             if self.gone:
                 raise SandboxGone("agvisor-x is gone")
-            self.calls.append((code, timeout, restart))
+            self.calls.append((code, timeout, restart) if context is None else (code, timeout, restart, context))
             return subprocess.CompletedProcess([], self.rc, self.out, "")
 
         def stop(self):
@@ -2035,6 +2035,986 @@ def test_mcp_ports():
     m.reset()
 
 
+def test_env():
+    secret = "s3cret-value"
+    for bad in ({}, {"1A": "x"}, {"A B": "x"}, {"A=B": "x"}, {"": "x"}, {"A": f"{secret}\nB=evil"}, {"A": f"{secret}\r"},
+                {"A": f"{secret}\0"}, {"A": 1}, {"A": None}, ["A=b"], "A=b"):
+        try:
+            Sandbox(env=bad)
+        except ValueError as e:
+            assert secret not in str(e), "an error must not repeat a value: it may be a secret"
+            continue
+        raise AssertionError(f"accepted {bad!r}")
+
+    assert "--env-file=/dev/stdin" not in Sandbox().run_args()
+    a = Sandbox(env={"MODE": "ci"}).run_args()
+    assert "--env-file=/dev/stdin" in a and a.index("--env-file=/dev/stdin") < a.index("ubuntu:24.04")  # a flag, before the image
+    assert not any("MODE" in x for x in a)  # stdin only: a command line shows up in `ps`
+
+    # create_sandbox: the variables ride on docker run's stdin; with egress= the proxy's own lines come last and win
+    calls = []
+
+    def run(cmd, **kw):
+        calls.append((cmd[1:], kw.get("input")))
+        return subprocess.CompletedProcess(cmd, 0, "172.18.0.2\n" if cmd[1] == "inspect" else "", "")
+
+    with mock.patch("agvisor.sandbox.subprocess.run", run):
+        create_sandbox(env={"MODE": "ci", "TOKEN": secret}).stop()
+        assert calls[0][1] == f"MODE=ci\nTOKEN={secret}\n" and not any(secret in str(c) for c, _ in calls)
+        calls.clear()
+        create_sandbox(env={"HTTPS_PROXY": "http://evil:1"}, egress=["pypi.org"]).stop()
+        box = [i for c, i in calls if c[0] == "run" and "ubuntu:24.04" in c][0]
+        lines = box.splitlines()
+        assert lines[0] == "HTTPS_PROXY=http://evil:1" and [l for l in lines if l.startswith("HTTPS_PROXY=")][-1].startswith("HTTPS_PROXY=http://agvisor:")
+        calls.clear()
+        create_sandbox().stop()
+        assert calls[0][1] is None  # nothing to say on stdin
+
+    # exec(env=, cwd=): a file only we can read, never `-e`; removed afterwards
+    seen = []
+
+    def docker(cmd, **kw):
+        flag = next(x for x in cmd if x.startswith("--env-file="))
+        path = flag.split("=", 1)[1]
+        seen.append((cmd, Path(path).read_text(), oct(os.stat(path).st_mode & 0o777), path))
+        return subprocess.CompletedProcess(cmd, 0, "", "")
+
+    sb = Sandbox()
+    with mock.patch("agvisor.sandbox.subprocess.run", docker):
+        sb.exec("true", env={"API_KEY": secret, "N": "1"}, cwd="/workspace/proj")
+    cmd, text, mode, path = seen[0]
+    assert text == f"API_KEY={secret}\nN=1\n" and mode == "0o600" and not os.path.exists(path)
+    assert not any(secret in x for x in cmd) and "-e" not in cmd  # `ps` on the client's machine shows the command line
+    assert cmd[cmd.index("-w") + 1] == "/workspace/proj" and cmd.index("-w") < cmd.index(sb.name)  # flags before the container
+
+    streamed = []
+    sb._stream = lambda *args, on_output: (streamed.append(args), subprocess.CompletedProcess([], 0, "", ""))[1]
+    sb.exec("true", env={"A": "b"}, on_output=lambda _: None)  # the streaming path takes them too
+    assert any(x.startswith("--env-file=") for x in streamed[0]) and streamed[0][:2] == ("exec", "-i")
+    for bad in ({"cwd": "relative"}, {"cwd": ""}, {"cwd": "/a\0b"}, {"env": {"A B": "c"}}, {"env": {"A": "b\nc"}}):
+        try:
+            sb.exec("true", **bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"accepted {bad}")
+    plain = []
+    with mock.patch("agvisor.sandbox.subprocess.run", lambda cmd, **kw: (plain.append(cmd), subprocess.CompletedProcess(cmd, 0, "", ""))[1]):
+        sb.exec("true", cwd="/tmp")  # cwd alone needs no file
+        sb.exec("true")
+    assert "-w" in plain[0] and not any(x.startswith("--env-file") for c in plain for x in c) and "-w" not in plain[1]
+
+    # spawn(): the job starts with them
+    jobs = []
+    sb2 = Sandbox()
+    sb2.exec = lambda cmd, **kw: (jobs.append(kw), subprocess.CompletedProcess([], 0, "", ""))[1]
+    sb2.spawn("x", env={"A": "b"}, cwd="/tmp")
+    assert jobs[0]["env"] == {"A": "b"} and jobs[0]["cwd"] == "/tmp"
+
+
+def test_env_cli_and_mcp():
+    from agvisor import cli, mcp_server as m
+
+    def main(*argv):
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            try:
+                rc = cli.main(list(argv))
+            except SystemExit as e:
+                rc = e.code
+        return rc, out.getvalue(), err.getvalue()
+
+    # agvisor exec: --env NAME=VALUE, --env NAME (from our own environment), --cwd
+    seen = []
+
+    class Fake(Sandbox):
+        def exec(self, cmd, **kw):
+            seen.append((cmd, kw["env"], kw["cwd"]))
+            return subprocess.CompletedProcess([], 0, "", "")
+
+    with mock.patch("agvisor.cli.list_sandboxes", lambda *a, **kw: [_running(Fake(name="old"))]), mock.patch.dict(os.environ, {"TOK": "s3"}):
+        assert main("exec", "agvisor-old", "--env", "A=1", "--env", "TOK", "--cwd", "/tmp", "echo", "hi")[0] == 0
+        assert seen[-1] == ("echo hi", {"A": "1", "TOK": "s3"}, "/tmp")
+        assert main("exec", "agvisor-old", "true")[0] == 0 and seen[-1] == ("true", None, None)
+        assert main("exec", "agvisor-old", "--env", "NOPE", "true")[0] == 2  # unset: a usage error, not a variable set to nothing
+    with mock.patch("agvisor.cli.list_sandboxes", lambda *a, **kw: [_running(Sandbox(name="old"))]):  # the real exec(): it validates
+        rc, _, err = main("exec", "agvisor-old", "--env", "A B=secret-x", "true")
+        assert rc == 2 and "A B" in err and "secret-x" not in err  # a bad name is refused without echoing the value
+
+    # agvisor run --env reaches create_sandbox
+    made = {}
+
+    class Box:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *_):
+            pass
+
+        def exec(self, cmd, timeout, on_output):
+            return subprocess.CompletedProcess([], 0, "", "")
+
+    def create(image, **kw):
+        made.update(kw)
+        return Box()
+
+    with mock.patch("agvisor.cli.create_sandbox", create), mock.patch.dict(os.environ, {"TOK": "s3"}):
+        assert main("run", "img", "--env", "MODE=ci", "--env", "TOK", "--", "true")[0] == 0
+        assert made["env"] == {"MODE": "ci", "TOK": "s3"}
+        assert main("run", "img", "--", "true")[0] == 0 and made["env"] is None
+
+    # MCP: AGVISOR_ENV is the user's, validated at startup, and reaches create_sandbox
+    def envset(**kw):
+        return mock.patch.dict(os.environ, {f"AGVISOR_{k}": v for k, v in kw.items()})
+
+    assert m._envvars() is None
+    with envset(ENV='{"MODE": "ci"}'):
+        assert m._envvars() == {"MODE": "ci"}
+    for bad in ("{", "[]", '{"A B": "x"}', '{"A": "line\\nbreak-s3cret"}', '{"A": 1}', "{}"):
+        with envset(ENV=bad):
+            try:
+                m._envvars()
+            except SystemExit as e:
+                assert "AGVISOR_ENV" in str(e) and "s3cret" not in str(e)
+            else:
+                raise AssertionError(f"accepted {bad!r}")
+
+    class Gone:
+        idle_ttl, host = 30, None
+
+        def exec(self, cmd, *, timeout, on_output):
+            return subprocess.CompletedProcess([], 0, "", "")
+
+        def stop(self):
+            pass
+
+    kws = []
+    m._sb = None
+    with mock.patch.object(m, "create_sandbox", lambda *a, **kw: (kws.append(kw), Gone())[1]), envset(ENV='{"MODE": "ci"}'):
+        m.run("x")
+        assert kws[0]["env"] == {"MODE": "ci"}
+    m._sb = None
+    with mock.patch.object(m, "create_sandbox", lambda *a, **kw: (kws.append(kw), Gone())[1]):
+        m.run("x")
+        assert kws[1]["env"] is None
+    m._sb = None
+
+
+def test_pause_resume():
+    import asyncio
+
+    from agvisor import SandboxPaused, aio, cli
+
+    calls, out = [], {"rc": 0, "err": ""}
+
+    def run(cmd, **kw):
+        calls.append(cmd[1:])
+        return subprocess.CompletedProcess(cmd, out["rc"], "", out["err"])
+
+    sb = Sandbox(name="proj")
+    with mock.patch("agvisor.sandbox.subprocess.run", run):
+        sb.pause()
+        assert calls == [["pause", "agvisor-proj"]]
+        calls.clear()
+        sb.resume()
+        assert calls == [["unpause", "agvisor-proj"]]  # no idle_ttl: no clock to restart
+        calls.clear()
+        Sandbox(name="proj", idle_ttl=60).resume()  # the idle clock restarts: the wall clock ran while the sandbox was frozen
+        assert calls[0] == ["unpause", "agvisor-proj"] and calls[1][:3] == ["exec", "agvisor-proj", "touch"], calls
+        out.update(rc=1, err="Error response from daemon: container agvisor-proj is already paused")
+        try:
+            sb.pause()
+        except RuntimeError as e:
+            assert "already paused" in str(e)  # docker's words, not a silent no-op
+        else:
+            raise AssertionError("pausing a paused sandbox must raise")
+        out.update(rc=1, err="Error response from daemon: container agvisor-proj is not paused")
+        try:
+            sb.resume()
+        except RuntimeError as e:
+            assert "not paused" in str(e)
+        else:
+            raise AssertionError("resuming a running sandbox must raise")
+
+        # exec() on a paused sandbox: SandboxPaused, not a command that "failed" with exit code 1
+        out.update(rc=1, err="Error response from daemon: Container 1f2e3d is paused, unpause the container before exec")
+        try:
+            sb.exec("true")
+        except SandboxPaused as e:
+            assert "resume()" in str(e) and isinstance(e, RuntimeError) and not isinstance(e, SandboxGone)
+        else:
+            raise AssertionError("exec() in a paused sandbox must raise SandboxPaused")
+        out.update(rc=1, err="the queue is paused")  # a command that says so itself is just a failed command
+        assert sb.exec("false").returncode == 1
+        out.update(rc=2, err="Error response from daemon: Container x is paused")  # only docker's exit code 1
+        assert sb.exec("false").returncode == 2
+
+    # snapshot still unpauses what it paused, through the same helper
+    calls.clear()
+    out.update(rc=0, err="")
+    with mock.patch("agvisor.sandbox.subprocess.run", run):
+        Sandbox(name="proj", idle_ttl=60).snapshot("t")
+    verbs = [c[0] for c in calls]
+    assert verbs.index("pause") < verbs.index("unpause"), verbs
+
+    # list_sandboxes: a paused container is running, and paused; `ls` says so
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S +0000 UTC")
+    ps = f"agvisor-a\tpaused\ta\t\t{now}\t\nagvisor-b\trunning\tb\t\t{now}\t\nagvisor-c\texited\tc\t\t{now}\t\n"
+    calls2, fake = fake_docker(ps_out=ps)
+    with mock.patch("agvisor.sandbox.subprocess.run", fake):
+        boxes = list_sandboxes()
+        assert [(b._running, b._paused) for b in boxes] == [(True, True), (True, False), (False, False)]
+        assert not Sandbox()._paused
+
+        def main(*argv):
+            buf = io.StringIO()
+            with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(io.StringIO()):
+                try:
+                    rc = cli.main(list(argv))
+                except SystemExit as e:
+                    rc = e.code
+            return rc, buf.getvalue()
+
+        rc, text = main("ls")
+        assert [l.split("\t")[:2] for l in text.splitlines()] == [["agvisor-a", "paused"], ["agvisor-b", "running"], ["agvisor-c", "stopped"]]
+        calls2.clear()
+        assert main("pause", "agvisor-b") == (0, "done\n") and ["docker", "pause", "agvisor-b"] in calls2
+        calls2.clear()
+        assert main("resume", "agvisor-a") == (0, "done\n") and ["docker", "unpause", "agvisor-a"] in calls2
+        assert main("pause", "agvisor-c")[0] == 2  # not running
+        assert main("pause", "nope")[0] == 2 and main("pause")[0] == 2
+
+    # the async interface awaits them
+    seen = []
+
+    async def scenario():
+        box = aio.AsyncSandbox(name="proj")
+        with mock.patch("agvisor.sandbox.subprocess.run", lambda cmd, **kw: (seen.append(cmd[1]), subprocess.CompletedProcess(cmd, 0, "", ""))[1]):
+            await box.pause()
+            await box.resume()
+
+    asyncio.run(scenario())
+    assert seen == ["pause", "unpause"]
+
+
+def simulate_pid1(script, freeze_at=0, hook_at=0, hook="", files=None):
+    """Run PID 1's shell script against a simulated clock: `date`, `sleep`, `stat` and `touch` are shims, so 100 s pass in
+    milliseconds. The n-th `sleep` can take 1000 s instead of its own (freeze_at: a pause()), and before the hook_at-th one
+    the shell command `hook` runs ($D is the directory, clock in $D/clock; what renew() or the sandbox's own code might do).
+    The script's /tmp/.agvisor_* files live in that directory. Returns (exit code, sleeps, directory contents reader)."""
+    with tempfile.TemporaryDirectory() as d:
+        for name, body in {
+            "date": 'cat "$D/clock"',  # only `date +%s` is used
+            "stat": 'cat "$D/mtime"',  # only `stat -c %Y FILE`
+            "touch": 'cp "$D/clock" "$D/mtime"',
+            "sleep": 'n=$(( $(cat "$D/n") + 1 )); echo $n > "$D/n"; [ $n -gt 300 ] && kill -TERM $PPID\n'  # a runaway loop is killed
+                     '[ $n -eq "$HOOK_N" ] && eval "$HOOK"\n'
+                     'c=$(cat "$D/clock"); if [ $n -eq "$FREEZE" ]; then echo $((c + 1000)) > "$D/clock"; else echo $((c + $1)) > "$D/clock"; fi',
+        }.items():
+            Path(d, name).write_text(f"#!/bin/sh\n{body}\n")
+            os.chmod(Path(d, name), 0o755)
+        for name in ("clock", "mtime", "n"):
+            Path(d, name).write_text("0\n")
+        env = {"PATH": f"{d}:/usr/bin:/bin", "D": d, "FREEZE": str(freeze_at), "HOOK_N": str(hook_at), "HOOK": hook}
+        r = subprocess.run(["sh", "-c", script.replace("/tmp/.agvisor", f"{d}/.agvisor")], env=env, capture_output=True, text=True, timeout=60)
+        return r.returncode, int(Path(d, "n").read_text()), lambda name: Path(d, name).read_text().strip()
+
+
+def test_idle_watchdog_survives_a_freeze():
+    """The idle watchdog (PID 1 of an idle_ttl sandbox) against a simulated clock: a `sleep` that took 1000 s was a
+    pause(), not idleness, and must not expire the sandbox when it wakes."""
+    script = Sandbox(idle_ttl=100).run_args()[-1]
+    rc, sleeps, _ = simulate_pid1(script)  # never frozen: expires once 100 s have passed without activity
+    assert rc == 0 and sleeps == 20, (rc, sleeps)  # 20 sleeps of 5 s reach 100 s
+    rc, sleeps, _ = simulate_pid1(script, freeze_at=3)  # frozen during the third sleep: it goes on, and expires a full ttl after waking
+    assert rc == 0 and sleeps == 3 + 20, (rc, sleeps)  # without the touch it would have expired right after sleep 3
+
+
+def test_renewable_lifetime():
+    a = Sandbox(lifetime=60, renewable=True).run_args()
+    assert "--rm" in a and a[-3:-1] == ["sh", "-c"] and "/tmp/.agvisor_deadline" in a[-1]  # PID 1 watches a deadline file
+    assert Sandbox(lifetime=60).run_args()[-2:] == ["sleep", "60"]  # not renewable: unchanged, a hard cap nothing inside can touch
+    assert "stat -c" not in a[-1] and "stat -c" in Sandbox(lifetime=60, idle_ttl=30, renewable=True).run_args()[-1]  # idle clock only if asked
+    for bad in ({"renewable": True}, {"renewable": True, "idle_ttl": 30}, {"renewable": True, "lifetime": 60, "gui": True}):
+        try:
+            Sandbox(**bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"accepted {bad}")
+
+    # PID 1, simulated. 5 s steps, so a deadline at 100 s takes 20 sleeps
+    script = Sandbox(lifetime=100, renewable=True).run_args()[-1]
+    rc, sleeps, _ = simulate_pid1(script)
+    assert rc == 0 and sleeps == 20, (rc, sleeps)
+    later = "echo $(( $(cat $D/clock) + 200 )) > $D/.agvisor_deadline"  # renew(200) before the 3rd sleep, when it is 10 s in
+    rc, sleeps, _ = simulate_pid1(script, hook_at=3, hook=later)
+    assert rc == 0 and sleeps == 42, (rc, sleeps)  # 210 s / 5
+    sooner = "echo $(( $(cat $D/clock) + 7 )) > $D/.agvisor_deadline"  # renew(7) at 5 s in: the deadline is 12 s
+    rc, sleeps, _ = simulate_pid1(script, hook_at=2, hook=sooner)
+    assert rc == 0 and sleeps == 3, (rc, sleeps)  # sleeps to 5 s and 10 s, then one of 2 s: never past the deadline
+    rc, sleeps, _ = simulate_pid1(script, hook_at=2, hook="rm $D/.agvisor_deadline")  # no deadline: expired, not forever
+    assert rc == 0 and sleeps == 2, (rc, sleeps)
+    rc, sleeps, _ = simulate_pid1(script, hook_at=2, hook="echo never > $D/.agvisor_deadline")  # junk reads as 0: expired
+    assert rc == 0 and sleeps == 2, (rc, sleeps)
+    # the lifetime is a wall-clock deadline: 1000 s frozen by pause() are 1000 s of it
+    rc, sleeps, _ = simulate_pid1(Sandbox(lifetime=500, renewable=True).run_args()[-1], freeze_at=3)
+    assert rc == 0 and sleeps == 3, (rc, sleeps)
+
+    # with idle_ttl too: whichever comes first, and a freeze is not idleness
+    both = Sandbox(lifetime=1000, idle_ttl=100, renewable=True).run_args()[-1]
+    rc, sleeps, _ = simulate_pid1(both)
+    assert rc == 0 and sleeps == 20, (rc, sleeps)  # idle after 100 s
+    rc, sleeps, _ = simulate_pid1(both, hook_at=10, hook="cp $D/clock $D/mtime")  # an exec at 45 s restarts the idle clock
+    assert rc == 0 and sleeps == 29, (rc, sleeps)  # 5k - 45 >= 100
+    rc, sleeps, _ = simulate_pid1(Sandbox(lifetime=50, idle_ttl=1000, renewable=True).run_args()[-1])
+    assert rc == 0 and sleeps == 10, (rc, sleeps)  # the lifetime came first
+    rc, sleeps, _ = simulate_pid1(Sandbox(lifetime=5000, idle_ttl=100, renewable=True).run_args()[-1], freeze_at=3)
+    assert rc == 0 and sleeps == 3 + 20, (rc, sleeps)  # frozen 1000 s during sleep 3: still a full idle_ttl after waking
+
+    # renew(): the command it runs, in a real shell against the same clock
+    cmds = []
+    sb = Sandbox(lifetime=100, renewable=True)
+    sb.exec = lambda cmd, **kw: (cmds.append((cmd, kw)), subprocess.CompletedProcess([], answer[0], "", "boom"))[1]
+    answer = [0]
+    sb.renew(300)
+    cmd, kw = cmds[0]
+    assert kw["timeout"] == 30 and "/tmp/.agvisor_deadline" in cmd and "+ 300" in cmd and "mv " in cmd  # written to a file and moved: atomic
+    for bad in (0, -5, 1.5, "60", None, True):
+        try:
+            sb.renew(bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"accepted {bad!r}")
+    assert len(cmds) == 1  # refused before any docker call
+    answer[0] = 3
+    try:
+        sb.renew(60)
+    except ValueError as e:
+        assert "not renewable" in str(e)
+    else:
+        raise AssertionError("renew() on a sandbox without a deadline file must raise")
+    answer[0] = 1
+    try:
+        sb.renew(60)
+    except RuntimeError as e:
+        assert "renew failed" in str(e) and not isinstance(e, ValueError)
+    else:
+        raise AssertionError("a failing renew must raise")
+
+    with tempfile.TemporaryDirectory() as d:
+        shim = Path(d, "date")
+        shim.write_text("#!/bin/sh\necho 1000\n")
+        os.chmod(shim, 0o755)
+        cmd = cmd.replace("/tmp/.agvisor", f"{d}/.agvisor")
+        run = lambda: subprocess.run(["sh", "-c", cmd], env={"PATH": f"{d}:/usr/bin:/bin"}, capture_output=True, text=True)
+        assert run().returncode == 3  # no deadline file: not a renewable sandbox
+        Path(d, ".agvisor_deadline").write_text("1100\n")
+        assert run().returncode == 0 and Path(d, ".agvisor_deadline").read_text().strip() == "1300"  # now + 300, not the old one + 300
+        assert not Path(d, ".agvisor_deadline.new").exists()
+
+    # idle_ttl: renew() counts as activity, like any exec(); and it works from a handle that list_sandboxes() made
+    idle = Sandbox(lifetime=100, idle_ttl=30, renewable=True)
+    seen = []
+    idle._docker = lambda *args, **kw: (seen.append(args), subprocess.CompletedProcess(args, 0, "", ""))[1]
+    idle.renew(60)
+    assert "/tmp/.agvisor_active" in seen[0][-1] and seen[0][-1].count("+ 60") == 1  # the exec's trap touches the marker
+    handle = Sandbox(host=None)  # a handle knows nothing of renewable: the file is the truth
+    handle._docker = lambda *args, **kw: subprocess.CompletedProcess(args, 0, "", "")
+    handle.renew(5)
+
+
+def test_renew_cli():
+    import asyncio
+
+    from agvisor import aio, cli
+
+    seen = []
+
+    class Fake(Sandbox):
+        def renew(self, seconds):
+            seen.append(seconds)
+            if self.name == "agvisor-plain":
+                raise ValueError("agvisor-plain is not renewable: create it with lifetime=... and renewable=True")
+
+    def main(*argv):
+        err = io.StringIO()
+        with contextlib.redirect_stdout(io.StringIO()) as out, contextlib.redirect_stderr(err):
+            try:
+                rc = cli.main(list(argv))
+            except SystemExit as e:
+                rc = e.code
+        return rc, out.getvalue(), err.getvalue()
+
+    with mock.patch("agvisor.cli.list_sandboxes", lambda *a, **kw: [_running(Fake(name="a")), _running(Fake(name="plain"))]):
+        assert main("renew", "agvisor-a", "600")[:2] == (0, "done\n") and seen == [600]
+        rc, _, err = main("renew", "agvisor-plain", "60")
+        assert rc == 2 and "not renewable" in err  # a usage error, not a traceback
+        assert main("renew", "agvisor-a")[0] == 2 and main("renew", "agvisor-a", "soon")[0] == 2 and main("renew", "nope", "5")[0] == 2
+
+    box = Sandbox(name="a")  # aio holds the class's own renew(): what can be faked is what it calls
+    box.exec = lambda cmd, **kw: (seen.append(cmd), subprocess.CompletedProcess([], 0, "", ""))[1]
+
+    async def scenario():
+        await aio.AsyncSandbox.of(box).renew(30)
+
+    asyncio.run(scenario())
+    assert "+ 30 )" in seen[-1]
+
+
+def test_python_contexts():
+    import sys
+
+    from agvisor import mcp_server as m
+    from agvisor.sandbox import _py
+
+    assert " 5 2>&1" in _py(5, 100) and " 5 a 2>&1" in _py(5, 100, "a") and "kill my-ctx 2>&1" in _py("kill", 100, "my-ctx")
+
+    d = tempfile.mkdtemp(dir="/tmp")  # short: a unix socket path is limited to ~100 characters
+    env = {**os.environ, "AGVISOR_PYDIR": f"{d}/py", "PATH": f"{os.path.dirname(sys.executable)}:{os.environ['PATH']}"}
+    ran = []
+
+    def local(cmd, *, input=None, timeout):  # the real command, run here with sh instead of inside a sandbox
+        ran.append(cmd)
+        try:
+            return subprocess.run(["/bin/sh", "-c", cmd], input=input, capture_output=True, text=True, env=env, timeout=timeout)
+        except subprocess.TimeoutExpired:
+            return subprocess.CompletedProcess([], 124, "", "")
+
+    sb = Sandbox()
+    sb.exec = local
+    try:
+        assert "new python session" in sb.python("x = 'default'").stdout
+        assert "new python session" in sb.python("x = 'a'", context="a").stdout  # its own interpreter: told so
+        assert "new python session" in sb.python("x = 'b'", context="b").stdout
+        # three interpreters, three sets of globals
+        assert [sb.python("x", context=c).stdout for c in (None, "a", "b")] == ["'default'\n", "'a'\n", "'b'\n"]
+        assert sb.python("x", context="a").stdout == "'a'\n"  # and context a is the same interpreter as before
+        sb.python("only_in_a = 1", context="a")
+        assert "NameError" in sb.python("only_in_a", context="b").stdout and "NameError" in sb.python("only_in_a").stdout
+        assert sorted(os.listdir(d)) == ["py", "py-a", "py-b"], os.listdir(d)  # a directory per context: sockets can't collide
+
+        # restart and a stuck call touch only their own context
+        assert "new python session" in sb.python("x", context="a", restart=True).stdout and "NameError" in sb.python("only_in_a", context="a").stdout
+        assert sb.python("x", context="b").stdout == "'b'\n" and sb.python("x").stdout == "'default'\n"
+        assert "TimeoutError" in sb.python("while True: pass", timeout=1, context="b").stdout  # the alarm: variables stay
+        assert sb.python("x", context="b").stdout == "'b'\n"
+        r = sb.python("import signal; signal.signal(signal.SIGALRM, signal.SIG_IGN)\nwhile True: pass", timeout=1, context="b")
+        assert r.returncode == 124  # stuck where the alarm can't reach: only b's interpreter was killed
+        assert sb.python("x", context="b").stdout.startswith("[new python session") and sb.python("x").stdout == "'default'\n"
+        sb.python("x = 'a again'", context="a")  # a was restarted above, and is untouched by what happened to b since
+        assert sb.python("x", context="a").stdout == "'a again'\n" and "NameError" in sb.python("x", context="b").stdout
+
+        n = len(ran)
+        for bad in ("../x", "", "a b", "a;b", "a/b", "a.b", "-a", "x" * 33, "$(id)", "é", 5, b"a"):
+            try:
+                sb.python("1", context=bad)
+            except ValueError as e:
+                assert "invalid python context" in str(e)
+                continue
+            raise AssertionError(f"accepted context {bad!r}")
+        assert len(ran) == n  # refused before anything ran
+        assert sb.python("1", context="x" * 32).stdout.startswith("[new python session")  # the longest name
+    finally:
+        for c in (None, "a", "b", "x" * 32):
+            subprocess.run(["/bin/sh", "-c", _py("kill", 1000, c)], env=env, capture_output=True)
+        shutil.rmtree(d, ignore_errors=True)
+
+    # the MCP tool: `context` is passed on; "" is no context; a bad name is an answer, not a traceback
+    class Fake:
+        idle_ttl = 60
+
+        def __init__(self):
+            self.calls = []
+
+        def python(self, code, *, timeout, restart, context=None):
+            if context is not None and not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_-]{0,31}", context):
+                raise ValueError(f"invalid python context {context!r}: letters, digits, '_', '-' only (max 32)")
+            self.calls.append(context)
+            return subprocess.CompletedProcess([], 0, "ok\n", "")
+
+        def stop(self):
+            pass
+
+    box = Fake()
+    m._sb = None
+    with mock.patch.object(m, "create_sandbox", lambda *a, **kw: box):
+        assert m.python("x") == "ok\n" and m.python("x", context="a") == "ok\n" and m.python("x", context="") == "ok\n"
+        assert box.calls == [None, "a", None]
+        msg = m.python("x", context="a b")
+        assert msg.startswith("invalid python context") and len(box.calls) == 3
+    m._sb = None
+
+
+def test_mounts():
+    from agvisor import cli, mcp_server as m
+
+    ok = lambda mounts: Sandbox(mounts=mounts).run_args()
+    a = ok({"/data/models": "/models", "/srv/ref/": "/ref"})
+    assert "--mount=type=bind,source=/data/models,target=/models,readonly" in a  # read-only, always: there is no way to ask for more
+    assert "--mount=type=bind,source=/srv/ref,target=/ref,readonly" in a  # normalised
+    assert a.index("--mount=type=bind,source=/srv/ref,target=/ref,readonly") < a.index("ubuntu:24.04")  # a flag, before the image
+    assert not any(x.startswith("--mount") or x.startswith("--volume=/") for x in Sandbox().run_args())
+    assert all(x.endswith(",readonly") for x in a if x.startswith("--mount"))
+    a = ok({"/x//y/./z": "/a//b"})
+    assert "--mount=type=bind,source=/x/y/z,target=/a/b,readonly" in a
+    assert "--volume=agvisor-p:/workspace" in Sandbox(name="p", mounts={"/d": "/d"}).run_args()  # next to a named sandbox's volume
+
+    for bad in ({}, [], "/a:/b", {"/": "/x"}, {"/x": "/"}, {"relative": "/x"}, {"/x": "relative"}, {"": "/x"}, {"/a/../etc": "/x"},
+                {"/a": "/x/../y"}, {"/proc": "/x"}, {"/proc/1": "/x"}, {"/sys/kernel": "/x"}, {"/dev": "/x"}, {"/dev/shm": "/x"},
+                {"/run": "/x"}, {"/var/run/docker.sock": "/x"}, {"/var/run": "/x"}, {"/home/me/docker.sock": "/x"}, {"/a": "/proc/x"},
+                {"/a": "/sys"}, {"/a": "/dev/x"}, {"//": "/x"}, {"//a": "/x"}, {"/a": "//b"},
+                {"/a,readonly=false": "/x"}, {"/a": "/x,type=volume"}, {"/a\nb": "/x"}, {"/a": 'x"'}, {"/a\0": "/x"}, {"/a": 5}, {5: "/x"},
+                {"/a": "/x", "/b": "/x/"}, {"/a": "/x", "/b": "/x//"}):
+        try:
+            Sandbox(mounts=bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"accepted {bad!r}")
+    ok({"/proc-data": "/x"})  # a prefix of a name, not a path under it
+    ok({"/var/running": "/x"})
+    ok({"/a": "/devices"})
+    ok({"/a": "/etc/data"})
+
+    # a mount is a docker run argument like any other: create_sandbox passes it on
+    calls = []
+    with mock.patch("agvisor.sandbox.subprocess.run", lambda cmd, **kw: (calls.append(cmd), subprocess.CompletedProcess(cmd, 0, "", ""))[1]):
+        create_sandbox(mounts={"/data": "/data"}).stop()
+    assert "--mount=type=bind,source=/data,target=/data,readonly" in calls[0]
+
+    # MCP: AGVISOR_MOUNTS is the user's, validated at startup
+    def envset(**kw):
+        return mock.patch.dict(os.environ, {f"AGVISOR_{k}": v for k, v in kw.items()})
+
+    with tempfile.TemporaryDirectory() as d, tempfile.TemporaryDirectory() as e:
+        assert m._mounts() is None
+        with envset(MOUNTS=f"{d}:/models, {e}:/ref"):
+            assert m._mounts() == {d: "/models", e: "/ref"}
+        for bad in (f"{d}", f"{d}:", ":/x", f"{d}:rel", f"{d}:/x,{d}:/y", f"{d}:/x,{e}:/x", "/:/x", f"{d}:/proc/x", "/var/run/docker.sock:/x", f"{d}:/x,"):
+            with envset(MOUNTS=bad):
+                try:
+                    m._mounts()
+                except SystemExit as err:
+                    assert "AGVISOR_MOUNTS" in str(err), bad
+                else:
+                    raise AssertionError(f"accepted {bad!r}")
+        with envset(MOUNTS=f"{d}/nope:/x"):  # docker is local: a missing path is reported now, not on the agent's first call
+            try:
+                m._mounts()
+            except SystemExit as err:
+                assert "does not exist" in str(err)
+            else:
+                raise AssertionError("a missing path was accepted")
+        with envset(MOUNTS=f"{d}/nope:/x", HOST="ssh://u@vm"):  # on another machine: can't tell from here
+            assert m._mounts() == {f"{d}/nope": "/x"}
+
+        class Box:
+            idle_ttl, host = 30, None
+
+            def exec(self, cmd, *, timeout, on_output):
+                return subprocess.CompletedProcess([], 0, "", "")
+
+            def stop(self):
+                pass
+
+        kws = []
+        m._sb = None
+        with mock.patch.object(m, "create_sandbox", lambda *a, **kw: (kws.append(kw), Box())[1]), envset(MOUNTS=f"{d}:/models"):
+            m.run("x")
+            assert kws[0]["mounts"] == {d: "/models"}
+        m._sb = None
+        with mock.patch.object(m, "create_sandbox", lambda *a, **kw: (kws.append(kw), Box())[1]):
+            m.run("x")
+            assert kws[1]["mounts"] is None
+        m._sb = None
+
+        # agvisor run --mount
+        made = {}
+
+        class Run:
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_):
+                pass
+
+            def exec(self, cmd, timeout, on_output):
+                return subprocess.CompletedProcess([], 0, "", "")
+
+        def main(*argv):
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                try:
+                    return cli.main(list(argv))
+                except SystemExit as err:
+                    return err.code
+
+        with mock.patch("agvisor.cli.create_sandbox", lambda image, **kw: (made.update(kw), Run())[1]):
+            assert main("run", "img", "--mount", f"{d}:/models", "--mount", f"{e}:/ref", "--", "true") == 0
+            assert made["mounts"] == {d: "/models", e: "/ref"}
+            assert main("run", "img", "--", "true") == 0 and made["mounts"] is None
+            assert main("run", "img", "--mount", "nodest", "--", "true") == 2 and main("run", "img", "--mount", ":/x", "--", "true") == 2
+
+
+def test_egress_policy():
+    import signal
+
+    from agvisor import egress_proxy as p
+
+    allow, deny = p.parse_policy(["pypi.org", "*.x.org:8080", "!admin.x.org", "!10.0.0.0/8", "!bad.org:25", "PyPI.io", "!Mixed.Case.org"])
+    assert [r[1] for r in allow] == ["pypi.org", "*.x.org", "pypi.io"]
+    assert deny == [("name", "admin.x.org", None), ("net", p.parse_rules(["10.0.0.0/8"])[0][1], None), ("name", "bad.org", (25,)),
+                    ("name", "mixed.case.org", None)]  # no port on a deny = every port; an explicit one is kept
+    assert p.parse_policy([]) == ([], [])
+    for bad in ("!", "!!x.org", "! x.org", "!a b", "!x.org:0", "!*", "!1.2.3.4/33", ""):
+        try:
+            p.parse_policy([bad])
+        except ValueError:
+            continue
+        raise AssertionError(f"accepted {bad!r}")
+
+    allow, deny = p.parse_policy(["*.x.org:*", "x.org", "10.0.0.0/8:*", "!admin.x.org", "!10.0.0.5", "!*.internal.x.org:22"])
+    ok = lambda h, port=443: p.check(allow, deny, h, port)
+    assert ok("a.x.org") == "name" and ok("a.x.org", 9999) == "name" and ok("x.org") == "name"
+    assert not ok("admin.x.org") and not ok("admin.x.org", 80) and not ok("admin.x.org", 9999)  # a deny is every port
+    assert ok("a.admin.x.org") == "name"  # exact name: its subdomains are not named
+    assert ok("10.0.0.4", 8080) == "net" and not ok("10.0.0.5", 8080) and not ok("10.0.0.5")
+    assert not ok("db.internal.x.org", 22) and ok("db.internal.x.org", 443) == "name"  # only the denied port
+    assert not ok("evil.org")  # no allow rule: still refused
+    assert p.check(allow, [], "admin.x.org", 443) == "name"  # without the deny it would pass
+
+    # edit(): the file changes in one step and the proxy is signalled; a bad entry changes nothing and signals nothing
+    with tempfile.TemporaryDirectory() as d:
+        path = os.path.join(d, "rules")
+        Path(path).write_text("pypi.org\n*.pythonhosted.org\n!admin.pypi.org\n")
+        hups = []
+        old = signal.signal(signal.SIGHUP, lambda *_: hups.append(1))
+        try:
+            read = lambda: Path(path).read_text().split()
+            p.edit([("allow", "Example.COM")], path, os.getpid())
+            assert read() == ["pypi.org", "*.pythonhosted.org", "!admin.pypi.org", "example.com"] and len(hups) == 1
+            p.edit([("deny", "example.com"), ("allow", "admin.pypi.org")], path, os.getpid())  # the last word on an entry stands
+            assert read() == ["pypi.org", "*.pythonhosted.org", "!example.com", "admin.pypi.org"] and len(hups) == 2
+            p.edit([("allow", "example.com"), ("deny", "example.com")], path, os.getpid())  # twice in one go
+            assert read()[-1] == "!example.com" and "example.com" not in read() and len(hups) == 3
+            before = Path(path).read_text()
+            for ops in ([("allow", "a b")], [("allow", "x.org:0")], [("allow", "*")], [("frob", "x.org")], [("allow", "ok.org"), ("allow", "")]):
+                try:
+                    p.edit(ops, path, os.getpid())
+                except ValueError:
+                    continue
+                raise AssertionError(f"accepted {ops!r}")
+            assert Path(path).read_text() == before and len(hups) == 3 and not os.path.exists(path + ".new")  # nothing written, nobody told
+            p.edit([("deny", "!x.org")], path, os.getpid())  # a leading '!' is the same as none
+            assert read()[-1] == "!x.org" and "!!x.org" not in read()
+        finally:
+            signal.signal(signal.SIGHUP, old)
+
+
+def test_egress_live_reload():
+    """The real proxy process: edit() rewrites its rules and signals it. A new connection follows the new rules at once,
+    and a tunnel that is already open is closed when its host is no longer allowed."""
+    import asyncio
+    import base64
+    import signal
+    import socket
+    import sys
+
+    import agvisor.egress_proxy as p
+
+    async def echo(r, w):  # the "origin": echoes what a tunnel sends until it ends
+        while data := await r.read(1024):
+            w.write(data)
+            await w.drain()
+        w.close()
+
+    async def connect(port, target, auth):
+        r, w = await asyncio.open_connection("127.0.0.1", port)
+        w.write(f"CONNECT {target} HTTP/1.1\r\n".encode() + auth + b"\r\n")
+        await w.drain()
+        return r, w, await asyncio.wait_for(r.readuntil(b"\r\n\r\n"), 5)
+
+    async def ping(port, target, auth):  # True if a tunnel to target works end to end
+        r, w, head = await connect(port, target, auth)
+        try:
+            if not head.startswith(b"HTTP/1.1 200"):
+                assert head.startswith(b"HTTP/1.1 403"), head
+                return False
+            w.write(b"ping\n")
+            return await asyncio.wait_for(r.readline(), 5) == b"ping\n"
+        finally:
+            w.close()
+
+    async def main(proc, rules, port, op):
+        auth = b"Proxy-Authorization: Basic " + base64.b64encode(b"agvisor:tok") + b"\r\n"
+        target = f"127.0.0.1:{op}"
+        edit = lambda *ops: asyncio.to_thread(subprocess.run, [sys.executable, p.__file__, "edit"], input="\n".join(ops) + "\n", text=True,
+                                              env={**os.environ, "AGVISOR_RULES": rules, "AGVISOR_PID": str(proc.pid)}, capture_output=True)
+        for _ in range(100):  # the proxy takes a moment to start
+            try:
+                assert await ping(port, target, auth)
+                break
+            except OSError:
+                await asyncio.sleep(0.1)
+        else:
+            raise AssertionError("the proxy never came up")
+        assert Path(rules).read_text().split() == [target]  # written at start: what the host reads back
+
+        r, w, head = await connect(port, target, auth)  # a tunnel that stays open
+        assert head.startswith(b"HTTP/1.1 200")
+        w.write(b"one\n")
+        assert await asyncio.wait_for(r.readline(), 5) == b"one\n"
+
+        res = await edit(f"deny {target}")
+        assert res.returncode == 0, res.stderr
+        assert await asyncio.wait_for(r.read(), 5) == b""  # the open tunnel was closed: dropEstablished
+        w.close()
+        assert not await ping(port, target, auth)  # a new one is refused...
+        assert Path(rules).read_text().split() == [f"!{target}"]
+
+        res = await edit(f"allow {target}")
+        assert res.returncode == 0 and await ping(port, target, auth)  # ...and allowed again
+        res = await edit("allow a b")  # junk: refused by the editor, the proxy never hears of it
+        assert res.returncode != 0 and "agvisor egress" in res.stderr and await ping(port, target, auth)
+        res = await edit("allow other.example.org", "deny other.example.org:25", f"allow {target}")  # several at once
+        assert res.returncode == 0 and Path(rules).read_text().split() == ["other.example.org", "!other.example.org:25", target]
+        assert await ping(port, target, auth)
+
+        # a bad file (someone wrote to it by hand, then HUP): the old rules stay, the sandbox is neither opened nor shut
+        Path(rules).write_text("*\n")  # not an entry
+        proc.send_signal(signal.SIGHUP)
+        await asyncio.sleep(0.5)
+        assert await ping(port, target, auth)
+
+    with tempfile.TemporaryDirectory() as d:
+        rules = os.path.join(d, "rules")
+        with socket.socket() as s:  # a free port for the proxy
+            s.bind(("127.0.0.1", 0))
+            port = s.getsockname()[1]
+
+        async def run():
+            origin = await asyncio.start_server(echo, "127.0.0.1", 0)
+            op = origin.sockets[0].getsockname()[1]
+            env = {**os.environ, "AGVISOR_ALLOW": f"127.0.0.1:{op}", "AGVISOR_TOKEN": "tok", "AGVISOR_RULES": rules, "AGVISOR_PORT": str(port)}
+            proc = subprocess.Popen([sys.executable, "-u", p.__file__], env=env, stdout=subprocess.PIPE, text=True)
+            try:
+                await main(proc, rules, port, op)
+            finally:
+                proc.terminate()
+                out = proc.communicate(timeout=10)[0]
+                origin.close()
+            return out
+
+        log = asyncio.run(run())
+    assert "reload 1 allow 0 deny" in log and "reload 0 allow 1 deny" in log, log  # the reloads, as the host sees them in `docker logs`
+    assert "reload failed, keeping the old rules" in log and "deny 127.0.0.1" in log, log  # and the refusal
+
+
+def test_egress_live_control():
+    import signal
+    import sys
+
+    # at creation: '!' entries are allowed, but they are not an allowlist by themselves
+    Sandbox(egress=["*.x.org", "!admin.x.org", "!10.0.0.0/8:*"])
+    for bad in (["!x.org"], ["!", "x.org"], ["x.org", "!!y.org"], ["x.org", "! y.org"]):
+        try:
+            Sandbox(egress=bad)
+        except ValueError:
+            continue
+        raise AssertionError(f"accepted egress={bad}")
+    Sandbox(inject={"api.x.com": {"A": "b"}}, egress=["!evil.com"])  # inject's own host is the allow entry
+    # the proxy's rules live on a tmpfs it can write (its root is read-only), under its own user and nobody else's
+    calls = []
+    with mock.patch("agvisor.sandbox.subprocess.run", lambda cmd, **kw: (calls.append(cmd), subprocess.CompletedProcess(cmd, 0, "10.0.0.2\n" if cmd[1] == "inspect" else "", ""))[1]):
+        create_sandbox(egress=["pypi.org"]).stop()
+    proxy = next(c for c in calls if c[1] == "run" and "python:3.12-slim" in c)
+    assert "--tmpfs=/run/agvisor:rw,noexec,nosuid,size=64k,uid=65534,gid=65534,mode=700" in proxy and "--read-only" in proxy
+
+    real_run, state = subprocess.run, {"logs": "", "fail": None}
+    with tempfile.TemporaryDirectory() as d:
+        rules = Path(d, "rules")
+        rules.write_text("pypi.org\n*.pythonhosted.org\n")
+        hups, calls = [], []
+
+        def docker(cmd, **kw):
+            calls.append((cmd[1:], kw.get("input")))
+            if state["fail"] and cmd[1] == "exec":
+                return subprocess.CompletedProcess(cmd, 1, "", state["fail"])
+            if cmd[1:4] == ["exec", "-i", "agvisor_proxy_x"] and cmd[4:6] == ["python", "-c"]:
+                # the very command docker would run in the proxy's container: this file's source, `edit`, the ops on stdin
+                r = real_run([sys.executable, "-c", cmd[6], *cmd[7:]], input=kw["input"], text=True, capture_output=True,
+                             env={**os.environ, "AGVISOR_RULES": str(rules), "AGVISOR_PID": str(os.getpid())})
+                return subprocess.CompletedProcess(cmd, r.returncode, r.stdout, r.stderr)
+            if cmd[1:4] == ["exec", "-i", "agvisor_proxy_x"] and cmd[4:] == ["cat", "/run/agvisor/rules"]:
+                return subprocess.CompletedProcess(cmd, 0, rules.read_text(), "")
+            if cmd[1:3] == ["logs", "agvisor_proxy_x"]:
+                return subprocess.CompletedProcess(cmd, 0, state["logs"], "")
+            raise AssertionError(f"unexpected docker call {cmd}")
+
+        sb = Sandbox(name="x", egress=["pypi.org", "*.pythonhosted.org"])
+        old = signal.signal(signal.SIGHUP, lambda *_: hups.append(1))
+        try:
+            with mock.patch("agvisor.sandbox.subprocess.run", docker):
+                assert sb.egress_rules() == ["pypi.org", "*.pythonhosted.org"]
+                sb.allow("Example.COM", "files.example.org:8443")
+                assert sb.egress_rules() == ["pypi.org", "*.pythonhosted.org", "example.com", "files.example.org:8443"] and len(hups) == 1
+                assert calls[-2][1] == "allow Example.COM\nallow files.example.org:8443\n"  # one exec, one signal, however many entries
+                sb.deny("example.com", "*.pythonhosted.org")
+                assert sb.egress_rules() == ["pypi.org", "files.example.org:8443", "!example.com", "!*.pythonhosted.org"] and len(hups) == 2
+                sb.allow("example.com")  # un-denied
+                assert sb.egress_rules()[-1] == "example.com" and "!example.com" not in sb.egress_rules() and len(hups) == 3
+
+                # what was refused, and still is
+                state["logs"] = ("allow pypi.org 443\ndeny evil.org 443\ndeny evil.org 443\ndeny example.org 443\ndeny a.pythonhosted.org 443\n"
+                                 "fail down.org 443 [Errno 111]\nreload 3 allow 1 deny\ndeny pypi.org 22\ndeny junk\ndeny x.org notaport\n"
+                                 "deny example.com 443\ndeny files.example.org 8443\n")
+                assert sb.egress_denied() == ["evil.org:443", "example.org:443", "a.pythonhosted.org:443", "pypi.org:22"], sb.egress_denied()
+                # example.com and files.example.org were refused once, and are allowed now: not in the list
+                sb.allow("evil.org")
+                assert sb.egress_denied() == ["example.org:443", "a.pythonhosted.org:443", "pypi.org:22"]
+                state["logs"] = ""
+                assert sb.egress_denied() == []
+
+                n = len(calls)
+                for bad in ((), ("a b",), ("x.org:0",), ("*",), ("ok.org", ""), ("!x.org",)):
+                    for fn in (sb.allow, sb.deny):
+                        try:
+                            fn(*bad)
+                        except ValueError:
+                            continue
+                        raise AssertionError(f"{fn.__name__}{bad} was accepted")
+                assert len(calls) == n and len(hups) == 4  # refused here: no docker call, no signal
+
+                state["fail"] = "Error response from daemon: No such container: agvisor_proxy_x"  # the sandbox expired, its proxy is gone
+                for fn in (lambda: sb.allow("x.org"), lambda: sb.deny("x.org"), sb.egress_rules, sb.egress_denied):
+                    try:
+                        fn()
+                    except SandboxGone as e:
+                        assert "egress proxy" in str(e)
+                        continue
+                    raise AssertionError("a gone proxy must raise SandboxGone")
+                state["fail"] = "OCI runtime exec failed: boom"
+                try:
+                    sb.allow("x.org")
+                except RuntimeError as e:
+                    assert "boom" in str(e) and not isinstance(e, SandboxGone)
+                else:
+                    raise AssertionError("a failing exec must raise")
+                state["fail"] = None
+
+                # a bad rules file (the editor refuses it before anything is written): ValueError comes out as a RuntimeError, file intact
+                before = rules.read_text()
+                rules.write_text("pypi.org\n*\n")  # corrupted behind our back
+                try:
+                    sb.allow("x.org")
+                except RuntimeError as e:
+                    assert "agvisor egress" in str(e)
+                else:
+                    raise AssertionError("an invalid rules file must not be rewritten into a valid-looking one")
+                assert rules.read_text() == "pypi.org\n*\n"
+                rules.write_text(before)
+        finally:
+            signal.signal(signal.SIGHUP, old)
+
+    # a sandbox that was made without egress=
+    for call in (lambda: Sandbox().allow("x.org"), lambda: Sandbox().deny("x.org"), Sandbox().egress_rules, Sandbox().egress_denied):
+        try:
+            call()
+        except ValueError as e:
+            assert "egress" in str(e)
+            continue
+        raise AssertionError("no allowlist: a ValueError")
+    # a handle from list_sandboxes() knows it has a proxy
+    now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S +0000 UTC")
+    calls2, fake = fake_docker(ps_out=f"agvisor-ab12\trunning\t\t\t{now}\t1\n")
+    with mock.patch("agvisor.sandbox.subprocess.run", fake):
+        handle = list_sandboxes()[0]
+    assert handle._has_egress and handle._proxy == "agvisor_proxy_ab12"
+
+
+def test_egress_cli_and_mcp():
+    import asyncio
+
+    from agvisor import aio, cli, mcp_server as m
+
+    seen = []
+
+    class Fake(Sandbox):
+        def allow(self, *entries):
+            seen.append(("allow", self.name, entries))
+            if entries == ("bad entry",):
+                raise ValueError("invalid egress entry 'bad entry'")
+
+        def deny(self, *entries):
+            seen.append(("deny", self.name, entries))
+
+        def egress_rules(self):
+            return ["pypi.org", "!admin.pypi.org"]
+
+        def egress_denied(self):
+            return ["evil.org:443", "x.org:25"]
+
+    def main(*argv):
+        out = io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(io.StringIO()):
+            try:
+                rc = cli.main(list(argv))
+            except SystemExit as e:
+                rc = e.code
+        return rc, out.getvalue()
+
+    stopped = Fake(name="stopped")
+    with mock.patch("agvisor.cli.list_sandboxes", lambda *a, **kw: [_running(Fake(name="a")), stopped]):
+        assert main("allow", "agvisor-a", "example.com", "*.pythonhosted.org:443") == (0, "done\n")
+        assert seen[-1] == ("allow", "agvisor-a", ("example.com", "*.pythonhosted.org:443"))
+        assert main("deny", "agvisor-a", "example.com") == (0, "done\n") and seen[-1] == ("deny", "agvisor-a", ("example.com",))
+        assert main("allow", "agvisor-a", "bad entry")[0] == 2  # a usage error, not a traceback
+        assert main("allow", "agvisor-a")[0] == 2 and main("deny", "agvisor-a")[0] == 2  # an entry is needed
+        assert main("allow", "nope", "x.org")[0] == 2 and main("allow", "agvisor-stopped", "x.org")[0] == 2  # no such sandbox / not running
+        assert main("egress", "agvisor-a") == (0, "pypi.org\n!admin.pypi.org\n")
+        assert main("egress", "agvisor-a", "--denied") == (0, "evil.org:443\nx.org:25\n")
+        assert main("egress", "nope")[0] == 2
+
+    # a sandbox without egress=: the library's ValueError is a usage error
+    with mock.patch("agvisor.cli.list_sandboxes", lambda *a, **kw: [_running(Sandbox(name="plain"))]):
+        assert main("allow", "agvisor-plain", "x.org")[0] == 2 and main("egress", "agvisor-plain")[0] == 2
+
+    # aio
+    box = Fake(name="b")
+    box._has_egress = True
+    calls = []
+    box.exec = None  # it would be a bug to call it
+
+    async def scenario():
+        sb = aio.AsyncSandbox.of(Sandbox(name="b", egress=["pypi.org"]))
+        with mock.patch("agvisor.sandbox.subprocess.run", lambda cmd, **kw: (calls.append(cmd), subprocess.CompletedProcess(cmd, 0, "pypi.org\n", ""))[1]):
+            assert await sb.egress_rules() == ["pypi.org"]
+            assert await sb.egress_denied() == []
+    asyncio.run(scenario())
+    assert calls[0][1:4] == ["exec", "-i", "agvisor_proxy_b"]
+
+    # MCP: the agent reads what was refused, and has no way to change the rules
+    class Box:
+        denied = ["evil.org:443", "x.org:25"]
+        gone = False
+
+        def egress_denied(self):
+            if self.gone:
+                raise SandboxGone("agvisor-x is gone")
+            return self.denied
+
+        def stop(self):
+            pass
+
+    box = Box()
+    m._sb = None
+    with mock.patch.object(m, "create_sandbox", lambda *a, **kw: box):
+        assert m.egress_blocked() == "evil.org:443\nx.org:25"
+        box.denied = []
+        assert m.egress_blocked() == "nothing was refused"
+        box.gone = True
+        assert m.egress_blocked().startswith("sandbox was reset") and m._sb is None
+    m._sb = None
+    assert not hasattr(m, "allow") and not hasattr(m, "deny")  # nothing in the server's own namespace that could be registered as a tool
+
+
 def test_skill_frontmatter_is_strict_yaml():
     # Claude Code and OpenCode forgive a bare `: ` inside a value; VS Code's strict YAML parser rejects the skill
     path = Path(__file__).parent.parent / ".claude/skills/agvisor/SKILL.md"
@@ -2092,5 +3072,17 @@ if __name__ == "__main__":
     test_mcp_stats()
     test_ports()
     test_mcp_ports()
+    test_env()
+    test_env_cli_and_mcp()
+    test_pause_resume()
+    test_idle_watchdog_survives_a_freeze()
+    test_renewable_lifetime()
+    test_renew_cli()
+    test_python_contexts()
+    test_mounts()
+    test_egress_policy()
+    test_egress_live_reload()
+    test_egress_live_control()
+    test_egress_cli_and_mcp()
     test_skill_frontmatter_is_strict_yaml()
     print("ok")
