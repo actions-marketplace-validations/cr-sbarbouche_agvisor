@@ -2,7 +2,7 @@
 
 [![PyPI Downloads](https://static.pepy.tech/personalized-badge/agvisor?period=total&units=INTERNATIONAL_SYSTEM&left_color=BLACK&right_color=GREEN&left_text=downloads)](https://pepy.tech/projects/agvisor)
 
-gVisor (`runsc`) sandboxes for coding agents. Thin wrapper over the `docker` CLI: CPU/memory/pids/disk limits, named sandboxes with snapshots, an outbound allowlist that can also inject credentials, background jobs, files in and out, an asyncio interface, a warm pool, an MCP server, and an optional GNOME desktop over RDP.
+gVisor (`runsc`) sandboxes for coding agents. Thin wrapper over the `docker` CLI: CPU/memory/pids/disk limits, named sandboxes with snapshots, an outbound allowlist that can also inject credentials, background jobs, files in and out, an asyncio interface, a warm pool, pause and resume, read-only mounts of host directories, an MCP server, and an optional GNOME desktop over RDP.
 
 Two packages, versioned separately:
 
@@ -79,10 +79,15 @@ sb.stop()                                      # without `with`, you stop it you
 | `egress` | an allowlist of hosts the sandbox may reach, instead of all or nothing: see [Limiting outbound traffic](#limiting-outbound-traffic). Headless only; don't combine with `network=` |
 | `lifetime` | seconds until the sandbox deletes itself, even if your process dies (headless only) |
 | `idle_ttl` | seconds without an `exec()` before the sandbox deletes itself, even if your process dies (headless only). Expiry can lag by up to ~5s. See below |
+| `renewable` | with `lifetime`: `sb.renew(seconds)` can move the deadline later or earlier, see [Expiry and cleanup](#expiry-and-cleanup). Off by default, because it lets code inside extend its own life |
+| `env` | environment variables for the sandbox, `{"MODE": "ci"}`: see below |
+| `mounts` | host directories shown to the sandbox read-only, `{"/data/models": "/models"}`: see [Showing a host directory](#showing-a-host-directory-read-only) |
 | `name` | makes the sandbox resumable, see below |
 | `host` | `None` = docker on this machine (or `$DOCKER_HOST`); `"ssh://user@host"` = docker on a remote VM/server |
 
 `sb.exec(cmd, input=None, timeout=120)` runs `sh -c cmd` inside and returns a `CompletedProcess`; on timeout the command is killed and `returncode` is 124. That relies on GNU `timeout`, so use Debian/Ubuntu-based images (`python:3.12-slim`, `ubuntu`). On Alpine (busybox) the code is 143 and only the shell is killed: the children of a compound command (`a; b`) keep running. An image's `ENTRYPOINT` is ignored: agvisor clears it for headless sandboxes, because it would take agvisor's own `sleep infinity` as arguments (`exec` never ran it anyway). If your entrypoint script did setup work, that no longer happens.
+
+`env=` on `create_sandbox` sets variables for everything that runs in the sandbox, and `sb.exec(cmd, env={...}, cwd="/some/dir")` adds some for one command (`spawn()` takes both too). They reach docker through its stdin or a file only you can read, never a command line, so a secret does not show in `ps` on your machine. One line per value, names like shell variables. The sandbox *holds* what you give it: for a key it should only be able to use, see [`inject=`](#credentials-the-sandbox-can-use-but-not-read). Like `limits`, `env=` is fixed when the sandbox is made: re-attaching to a running named one keeps the environment of its first start.
 
 `sb.stats()` says how much of the limits a sandbox is using right now: `{"cpu": 101.4, "memory": 254803968, "memory_limit": 2147483648, "pids": 74}` (CPU in percent of one core, memory in bytes; it takes about a second, since CPU needs two samples). Raises `SandboxGone` if the container is gone. `memory` counts RAM and `/tmp`, which is RAM-backed, but not files on the root filesystem or in `/workspace`; `pids` is what `--pids-limit` counts (below). `tests/test_gvisor_stats.py` checks each of these against real gVisor.
 
@@ -141,6 +146,7 @@ sb.exec("curl https://example.com")  # 403 from the proxy: "example.com:443 is n
 The sandbox gets a private docker network (`--internal`: no route out) and the only thing on it besides the sandbox is a small allowlist proxy, which also sits on the default bridge. `HTTP_PROXY`/`HTTPS_PROXY` point at it, so `pip`, `apt`, `curl` and Python's `urllib` just work; code that ignores the variables has no route anywhere. Sandboxes with `egress=` can't reach each other either: each has its own network.
 
 - Entries are `host` (exact), `*.host` (subdomains, not `host` itself), an IPv4 address or an IPv4 network, with an optional `:port`. Ports default to 80 and 443; `host:*` is any port. There is no allow-everything entry: that is `network="bridge"`.
+- `!entry` shuts a host out and wins over every allow: `egress=["*.example.com", "!admin.example.com"]`. Its port defaults to *every* port (an allow's is 80 and 443), so `!example.com` is all of it. At least one entry must be an allow.
 - **A name only gets through if it resolves to public addresses**, so a name can't be used to reach `10.x`, the docker host or the cloud metadata endpoint (`169.254.169.254`). Reaching a private address takes an entry that says so (`10.0.0.5`, `10.0.0.0/24`). The proxy connects to the address it checked, so a second lookup can't swap it.
 - It is an HTTP(S) proxy: raw sockets (SYN scans, ICMP, UDP) don't pass.
 - A tunnel (HTTPS, or any `CONNECT`) that carries no byte in either direction for 15 minutes is closed, so a stalled connection doesn't hold a socket until the sandbox goes. A download the client says nothing during is not quiet.
@@ -150,6 +156,24 @@ The sandbox gets a private docker network (`--internal`: no route out) and the o
 - Starting costs about six more docker calls: on `host="ssh://..."` that is noticeable (enable `ControlMaster`). Fixed at creation, like `limits`: re-attaching to a running named sandbox ignores `egress=`.
 - To give the sandbox a credential without handing it over, see [Credentials the sandbox can use but not read](#credentials-the-sandbox-can-use-but-not-read) below.
 - Checked on real gVisor (runsc 20261102.0, docker 29.1.3, WSL2): HTTPS and plain HTTP to listed hosts, a 403 that names the rule for the rest, no route around the proxy, no name resolution inside, `pip install` through it, and the cleanup above. `tests/test_gvisor_egress.py` runs that against a docker host.
+
+#### Changing the rules while it runs
+
+```python
+sb = create_sandbox("python:3.12-slim", egress=["pypi.org"])
+sb.exec("pip install requests")      # fails: files.pythonhosted.org isn't on the list
+sb.egress_denied()                   # ["files.pythonhosted.org:443"]: what it was refused, in the order it tried
+sb.allow("*.pythonhosted.org")       # at once, no restart: the same sandbox, its processes and files untouched
+sb.exec("pip install requests")      # works
+sb.deny("pypi.org")                  # and back; tunnels that are open to it are closed
+sb.egress_rules()                    # ["!pypi.org", "*.pythonhosted.org"]
+```
+
+The decision is yours, not the code's in the sandbox: it has no API to the rules (they are a file in the proxy's container, and the sandbox can only reach the proxy's port). `allow(*entries)` takes the same entries as `egress=` and un-denies one that was denied; `deny(*entries)` removes the entry and puts a `!entry` in its place, so it also carves a name out of a wildcard. `egress_denied()` leaves out what is allowed by now, so it is the list to show whoever approves. From a shell: `agvisor allow NAME host...`, `agvisor deny NAME host...`, `agvisor egress NAME [--denied]`. The MCP server's agent gets a read-only `egress_blocked()` tool (with `AGVISOR_EGRESS` or `AGVISOR_INJECT`), so it can tell you which host it needs; only you can allow it.
+
+- Changes apply to new connections at once (the proxy reloads on a signal), and close the open tunnels that the new rules no longer let through, so a `deny()` also stops a download in progress. A bad rules file is ignored: the old rules stay.
+- `egress_denied()` reads the proxy's log (one line per connection): fine for a long session, a few MB per million connections. Two callers changing rules at the same moment can lose one update: one controller per sandbox.
+- Needs `egress=` or `inject=` at creation (`ValueError` otherwise), and `SandboxGone` once the sandbox has expired and its proxy is gone. `tests/test_gvisor_egress_live.py` runs all of this against real gVisor.
 
 #### Credentials the sandbox can use but not read
 
@@ -184,6 +208,20 @@ sb.get_dir("/workspace/out", "./results")       # and out (max_bytes=50 MB of ta
 
 They are a tar through `put()`/`get()` (GNU tar in the image). `put_dir` copies links as links and never follows them, so a link on your side can't pull a host file into the sandbox, and resets owners. `get_dir` extracts what an untrusted sandbox sends with tarfile's `data` filter: nothing lands outside the destination, no device files, no setuid bits (`tarfile.FilterError` otherwise). Links that point outside the destination, every absolute one (a venv's `python`), are left out rather than followed or made an error: `get_dir` returns their names. From a shell: `agvisor put NAME ./file-or-dir /remote/path` and `agvisor get NAME /remote/path ./local`.
 
+### Showing a host directory (read-only)
+
+```python
+sb = create_sandbox("python:3.12-slim", mounts={"/data/models": "/models", "/srv/ref.csv": "/etc/ref.csv"})
+sb.exec("ls /models; wc -l /etc/ref.csv")      # the docker host's own files: nothing was copied
+sb.exec("echo x > /models/new")                # Read-only file system: it can't change any of it, not even as root
+```
+
+For a big dataset or a codebase you would rather not tar through `put_dir()`: a read-only bind mount, so it costs nothing to start and changes on the host show up inside. A directory or a single file; absolute paths; a source that doesn't exist is an error (docker's `--volume` would have made an empty directory owned by root). With `host="ssh://..."` the path is on that machine. Fixed at creation.
+
+- **The sandbox can read everything under the path**, hidden files included. Links inside it resolve in the sandbox's own filesystem, so a link to `/etc/passwd` shows the sandbox's file, not yours. Don't mount `~`, `/etc` or a directory with secrets in it.
+- Refused: `/`, anything under `/proc`, `/sys`, `/dev`, a source under `/run` or `/var/run`, and any `*.sock` (a docker socket would be the host). That is a guard against mistakes by whoever chose the paths, not against them: they decide what is shared.
+- Use `put_dir()` when the sandbox should be able to edit its copy. `tests/test_gvisor_mounts.py` checks all of this on real gVisor.
+
 ### Background jobs
 
 ```python
@@ -215,6 +253,8 @@ sb.python("rows[:3]", timeout=30, restart=False)                                
 ```
 
 Like notebook cells: variables, imports and functions survive between calls, and the value of a last expression is printed. `r` is a `CompletedProcess`: a Python exception is a traceback in `r.stdout`, not a return code. At `timeout` (default 60 s) the code gets a `TimeoutError` and the session survives; stuck where that can't reach it (a C call), the session is killed and `returncode` is 124. 127 means no `python3` in the image (`python:3.12-slim` has it). `max_bytes` (default 30 KB) cuts what comes back, inside the sandbox. The interpreter is a process in the container, so it goes with it: a new one starts (and says so) after a reset, `lifetime` or `idle_ttl`. Each call is one `exec()`, so `timeout + 5` must stay under `idle_ttl`. It is also an MCP tool, `python`. `tests/test_gvisor_mcp.py` runs it against real gVisor.
+
+`sb.python(code, context="analysis")` is a session of its own: each name is a separate interpreter with its own variables, so two lines of work don't share globals, and `restart=True` or a timeout that kills one leaves the others. No `context` is the original session. Names are letters, digits, `_` and `-` (up to 32). Each costs the memory of an idle interpreter until the sandbox ends (all of it counts in `limits.memory`). The MCP tool takes `context` too. `tests/test_gvisor_pycontexts.py` runs it against real gVisor.
 
 ### Async
 
@@ -283,22 +323,24 @@ for sb in list_sandboxes(host="ssh://user@my-vm"):                 # every agvis
 ```
 
 - `idle_ttl`: the clock restarts when each `exec()` starts and ends; background processes don't count. `exec(timeout=)` must be shorter than `idle_ttl` (else `ValueError`), so a command can't outlive the sandbox. It is fixed at creation, like `limits`.
+- `renewable=True` (with `lifetime=`): `sb.renew(seconds)` makes it expire `seconds` from now instead, later or earlier, as often as you like (`agvisor renew NAME SECONDS`). It costs the hard cap: PID 1 reads the deadline from a file inside the sandbox, so **code running there can extend its own life** by writing it. A plain `lifetime` stays a budget it can't touch; use `renewable` when you decide what runs. The deadline is wall-clock, a pause counts against it, and `idle_ttl` still applies on top. `tests/test_gvisor_renew.py` runs it against real gVisor.
+- `sb.pause()` freezes every process (no CPU; the memory stays held: it is a freeze, not a checkpoint to disk) until `sb.resume()`; `exec()` on a paused sandbox raises `SandboxPaused`, not an exit code. `agvisor pause NAME` / `resume NAME`, and `agvisor ls` shows `paused`. `idle_ttl` does not run out while it is paused (the watchdog notices a freeze and restarts its clock), `lifetime` keeps counting. `tests/test_gvisor_pause.py` checks the freeze, and prints what the lifetime did.
 - A named sandbox that expires keeps its files: the next `create_sandbox(name=...)` makes a fresh container on the same volume. `delete()` is what erases them: run it from your own retention job.
 - `list_sandboxes()` also finds anonymous sandboxes left behind by a crashed process. Don't `start()` a stopped handle: it would make a fresh default-image container.
 - `sb.created` is a timezone-aware `datetime` (second precision) of when the container was made, so a retention job can stop what is older than it should be: `[sb.stop() for sb in list_sandboxes() if now - sb.created > max_age]`. Sandboxes from `create_sandbox()` have `created = None`.
 - `owner=` tags a sandbox, e.g. with a tenant id: `create_sandbox(name="u42-scan7", owner="u42")`, and `list_sandboxes(owner="u42")` lists only theirs. See the `name=` note under Security for what it does and doesn't protect.
-- `agvisor ls`, `agvisor rm`, `agvisor exec` do the same from a shell (add `--host ssh://user@vm` for a remote one, `--owner` to filter): `ls` prints name, state, owner and creation time; `rm NAME...` and/or `rm --older-than SECONDS` removes sandboxes (never everything at once: it needs one of the two), `--data` also erases the files and snapshots of named ones; `exec NAME cmd...` runs a command in a running sandbox and exits with its exit code; `put` and `get` copy files and directories (see Files in and out). A retention job is `agvisor rm --older-than 14400` in cron. `exec`, `put` and `get` don't count as activity for `idle_ttl`. `agvisor prune` removes what expired `egress=` sandboxes left behind.
+- `agvisor ls`, `agvisor rm`, `agvisor exec` do the same from a shell (add `--host ssh://user@vm` for a remote one, `--owner` to filter): `ls` prints name, state, owner and creation time; `rm NAME...` and/or `rm --older-than SECONDS` removes sandboxes (never everything at once: it needs one of the two), `--data` also erases the files and snapshots of named ones; `exec NAME cmd...` runs a command in a running sandbox and exits with its exit code; `put` and `get` copy files and directories (see Files in and out). A retention job is `agvisor rm --older-than 14400` in cron. `exec`, `put` and `get` don't count as activity for `idle_ttl`. `agvisor prune` removes what expired `egress=` sandboxes left behind. `agvisor pause`, `resume`, `renew`, `allow`, `deny` and `egress` are described above; `exec` takes `--env NAME[=VALUE]` and `--cwd`, and `run` takes `--env` and `--mount HOSTPATH:REMOTE` too.
 
 ## Examples
 
-[`examples/`](https://github.com/cr-sbarbouche/agvisor/tree/main/examples) has eight small, runnable scripts (quickstart, resuming and snapshots, limits, files and jobs, the egress allowlist, `network="isolated"`, the `/workspace` cap, a headless browser). CI runs all of them against real gVisor.
+[`examples/`](https://github.com/cr-sbarbouche/agvisor/tree/main/examples) has eleven small, runnable scripts (quickstart, resuming and snapshots, limits, files and jobs, the egress allowlist, `network="isolated"`, the `/workspace` cap, a headless browser with and without `egress=`, Claude Code's CLI with its API key out of reach, and a one-sandbox-per-trial evaluation harness). CI runs all of them against real gVisor.
 
 ## Coding agents (skill + MCP server)
 
 Two optional pieces for Claude Code, VS Code (Copilot agent mode) and OpenCode:
 
 - **Skill**, [`.claude/skills/agvisor/SKILL.md`](https://github.com/cr-sbarbouche/agvisor/blob/main/.claude/skills/agvisor/SKILL.md): tells the agent when to sandbox, plus the gotchas above. Copy the `agvisor` folder to `.claude/skills/` (all three read it), or to `.github/skills/` / `.agents/skills/`.
-- **MCP server**, `agvisor-mcp`: `run(command, timeout)`, `write_file(path, content)`, `read_file(path)`, `edit_file(path, old, new)` (one exact, unique piece of text replaced), `list_files(path)`, `python(code, timeout, restart)` (a session that keeps variables between calls, like notebook cells: needs `python3` in `AGVISOR_IMAGE`; the interpreter is lost when the sandbox is reset), `start_job(command)`/`job_output(job_id, offset)`/`kill_job(job_id)` for what outlives `run()`, `stats()` (CPU, memory and processes against their limits: what to look at after a command died), and `reset()` (plus the snapshot tools, opt-in, below), so the agent runs code in the sandbox, not on your host. It makes one sandbox on first use and keeps it until it has been idle for `AGVISOR_IDLE_TTL`. A skill only advises; to make the sandbox the *only* way the agent runs code, also turn off its host shell tool (if your client lets you).
+- **MCP server**, `agvisor-mcp`: `run(command, timeout)`, `write_file(path, content)`, `read_file(path)`, `edit_file(path, old, new)` (one exact, unique piece of text replaced), `list_files(path)`, `python(code, timeout, restart, context)` (a session that keeps variables between calls, like notebook cells: needs `python3` in `AGVISOR_IMAGE`; the interpreter is lost when the sandbox is reset), `start_job(command)`/`job_output(job_id, offset)`/`kill_job(job_id)` for what outlives `run()`, `stats()` (CPU, memory and processes against their limits: what to look at after a command died), and `reset()` (plus the snapshot tools, opt-in, below), so the agent runs code in the sandbox, not on your host. It makes one sandbox on first use and keeps it until it has been idle for `AGVISOR_IDLE_TTL`. A skill only advises; to make the sandbox the *only* way the agent runs code, also turn off its host shell tool (if your client lets you).
 
 Settings are environment variables, so the agent can't pick its own image, network or limits:
 
@@ -309,6 +351,8 @@ Settings are environment variables, so the agent can't pick its own image, netwo
 | `AGVISOR_EGRESS` | unset. Comma-separated hosts the sandbox may reach, e.g. `pypi.org,files.pythonhosted.org`: [`egress=`](#limiting-outbound-traffic), instead of `AGVISOR_NETWORK` |
 | `AGVISOR_INJECT` | unset. Credentials the sandbox can use but not read, as JSON: `{"api.example.com": {"Authorization": "Bearer sk-..."}}` ([`inject=`](#credentials-the-sandbox-can-use-but-not-read), needs `agvisor[inject]`). Those hosts are reachable; it replaces `AGVISOR_NETWORK` like `AGVISOR_EGRESS`, and can be combined with it |
 | `AGVISOR_PORTS` | unset. Comma-separated container ports to reach from your machine, e.g. `8000,3000` ([`ports=`](#reaching-a-server-inside)); adds a `port(container_port)` tool that returns the address. Needs `AGVISOR_NETWORK=bridge` or `isolated`, without `AGVISOR_EGRESS` / `AGVISOR_INJECT` |
+| `AGVISOR_ENV` | unset. Environment variables for the sandbox as JSON: `{"MODE": "ci"}` ([`env=`](#use)). The sandbox holds them: for a credential it should only use, `AGVISOR_INJECT` |
+| `AGVISOR_MOUNTS` | unset. `HOST_DIR:/DEST[,HOST_DIR:/DEST...]`: directories of the docker host shown to the sandbox read-only, e.g. `/data/models:/models` ([`mounts=`](#showing-a-host-directory-read-only)). Nothing is copied, and the agent can't change them |
 | `AGVISOR_IMAGE` | `ubuntu:24.04` |
 | `AGVISOR_CPUS` / `AGVISOR_MEMORY` | `2` / `2g` |
 | `AGVISOR_IDLE_TTL` / `AGVISOR_LIFETIME` | `600` / `3600` seconds |
@@ -457,6 +501,9 @@ Either way: the sandbox removes itself `timeout` + 5 minutes after it started ev
 - **`network="bridge"` also reaches the outside:** the internet, services listening on the host itself (through the bridge gateway), and on a cloud VM the metadata endpoint that serves instance credentials (see Host setup). Block what you don't want on the host's firewall, or use `network="none"`.
 - **`egress=` limits what a sandbox can connect to, not what it can say.** Allowed hosts can receive anything (data can ride in a URL to an allowed host), and an allowed name that an attacker controls the DNS of (a `*.` entry on a domain someone else can add subdomains to) can serve anything. On the one setup I tried (docker 29.1.3, runsc, WSL2) the sandbox couldn't resolve any name itself, so DNS is not a side channel there; other docker or gVisor versions are untested. The proxy container runs under `runc`, outside gVisor (see above). The proxy and the network are plain docker objects: whoever can run `docker` can read the proxy password and the allowlist.
 - **`inject=` puts a TLS-ending proxy in the path of the sandbox's requests.** The proxy parses TLS and HTTP bytes that the sandbox sends it, under docker's `runc` rather than gVisor (see `egress=`), and holds the private key of the certificate the sandbox is told to trust, for the injected hosts only: whoever takes over the proxy can impersonate those hosts to that one sandbox and read the credentials in its environment. The credentials are in the proxy container's environment, so whoever can run `docker inspect` on the host can read them. A sandbox can use a credential for anything its host accepts, and read it back if the service echoes request headers. Inject the narrowest credential the task needs.
+- **`mounts=` shows host files to code you don't trust.** It is read-only, but read-only is all it is: everything under the path can be read, including secrets in it, and a kernel or runsc bug that gives write access gives it to the host's files. Mount the narrowest directory that does the job. Source paths under `/run`, `/var/run`, `/proc`, `/sys`, `/dev` and `*.sock` are refused as a guard against mistakes, not as a boundary.
+- **`renewable=True` lets the sandbox extend its own `lifetime`** (the deadline is a file inside it). Leave it off when `lifetime` is the budget for hostile code. `env=` values are in the sandbox's environment: it holds them (unlike `inject=`).
+- **`sb.allow()` and the CLI's `agvisor allow` widen what a sandbox can reach.** There is no way to call them from inside the sandbox, and the MCP server doesn't expose them to the agent; whoever can run docker on the host can change any proxy's rules anyway.
 - **`gui=True` runs `--privileged`.** Under gVisor that only grants simulated capabilities; under plain `runc` it would be real, so agvisor refuses `runc` for GUI sandboxes. The RDP password is random per sandbox and the gateway token is encrypted and authenticated, but anyone holding a token can open a session until it expires.
 
 To report a vulnerability, email sadokbarbouche1@outlook.com instead of opening a public issue (details in `SECURITY.md`).

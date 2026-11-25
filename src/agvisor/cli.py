@@ -1,4 +1,4 @@
-"""agvisor ls | rm | prune | exec | put | get | run: look at, clean up, poke and feed the sandboxes on a docker host, or run one command in a fresh one."""
+"""agvisor ls | rm | prune | exec | put | get | pause | resume | renew | allow | deny | egress | run: look at, clean up, poke, feed and park the sandboxes on a docker host, or run one command in a fresh one."""
 import argparse
 import os
 import shlex
@@ -27,6 +27,8 @@ def main(argv=None):
     ex.add_argument("name")
     ex.add_argument("command", nargs="+", help="joined with spaces and run by `sh -c`")
     ex.add_argument("--timeout", type=int, default=120)
+    ex.add_argument("--env", action="append", default=[], metavar="NAME[=VALUE]", help="a variable for this command, repeatable; without =VALUE it is taken from your own environment")
+    ex.add_argument("--cwd", help="absolute directory to start in")
     put = sub.add_parser("put", parents=[common], help="copy a local file or directory into a running sandbox")
     put.add_argument("name")
     put.add_argument("local")
@@ -36,6 +38,18 @@ def main(argv=None):
     get.add_argument("remote")
     get.add_argument("local", help="a file or a directory here (replaced / merged into)")
     get.add_argument("--max-bytes", type=int, help="refuse more than this (default 10 MB for a file, 50 MB for a directory)")
+    for verb, what in (("allow", "let a running egress= sandbox reach more hosts, at once"), ("deny", "shut hosts out of a running egress= sandbox, at once")):
+        v = sub.add_parser(verb, parents=[common], help=what)
+        v.add_argument("name")
+        v.add_argument("entries", nargs="+", help="host, *.host, an IPv4 address or network, each with an optional :port")
+    eg = sub.add_parser("egress", parents=[common], help="the rules of a running egress= sandbox, one per line (a leading ! is a deny)")
+    eg.add_argument("name")
+    eg.add_argument("--denied", action="store_true", help="instead: what it tried to reach and was refused, as host:port")
+    sub.add_parser("pause", parents=[common], help="freeze a running sandbox (no CPU; memory stays held) until `resume`").add_argument("name")
+    sub.add_parser("resume", parents=[common], help="unfreeze a paused sandbox").add_argument("name")
+    rn = sub.add_parser("renew", parents=[common], help="make a renewable sandbox expire SECONDS from now (create_sandbox(lifetime=, renewable=True))")
+    rn.add_argument("name")
+    rn.add_argument("seconds", type=int)
     r = sub.add_parser("run", help="make a sandbox, run one command in it, remove it: exits with the command's code (a CI step)")
     r.add_argument("image")
     r.add_argument("command", nargs="+", help="joined with spaces and run by `sh -c`; put it after --")
@@ -44,10 +58,14 @@ def main(argv=None):
     r.add_argument("--memory", default="2g")
     r.add_argument("--pids", type=int, default=512)
     r.add_argument("--timeout", type=int, default=600, help="seconds for the command")
+    r.add_argument("--env", action="append", default=[], metavar="NAME[=VALUE]",
+                   help="a variable for the sandbox, repeatable; without =VALUE it is taken from your own environment")
     r.add_argument("--egress", action="append", default=[], metavar="HOST", help="allowlist entry, repeatable; none = open network")
     r.add_argument("--inject", action="append", default=[], metavar="HOST:HEADER=ENVVAR",
                    help="send HEADER to HOST with the value of $ENVVAR, which the sandbox never sees; repeatable")
     r.add_argument("--put", action="append", default=[], metavar="LOCAL:REMOTE", help="copy a local directory in before the command")
+    r.add_argument("--mount", action="append", default=[], metavar="HOSTPATH:REMOTE",
+                   help="show a path of the docker host inside, read-only and without copying it; repeatable")
     r.add_argument("--get", action="append", default=[], metavar="REMOTE:LOCAL", help="copy a directory out after it, even if it failed")
     a = p.parse_args(argv)
 
@@ -59,7 +77,7 @@ def main(argv=None):
     boxes = list_sandboxes(a.host, owner=a.owner)
     if a.cmd == "ls":
         for sb in boxes:
-            print(sb.name, "running" if sb._running else "stopped", sb.owner or "-", sb.created.isoformat(), sep="\t")
+            print(sb.name, "paused" if sb._paused else "running" if sb._running else "stopped", sb.owner or "-", sb.created.isoformat(), sep="\t")
         return 0
     missing = [n for n in (a.names if a.cmd == "rm" else [a.name]) if n not in {sb.name for sb in boxes}]
     if missing:
@@ -90,15 +108,46 @@ def main(argv=None):
                     print(f"left out {len(skipped)} link(s) that point outside: {', '.join(skipped[:5])}", file=sys.stderr)
             else:
                 Path(a.local).write_bytes(sb.get(a.remote, **kw))
+        elif a.cmd in ("allow", "deny"):
+            getattr(sb, a.cmd)(*a.entries)
+        elif a.cmd == "egress":
+            print(*(sb.egress_denied() if a.denied else sb.egress_rules()), sep="\n")
+            return 0
+        elif a.cmd == "pause":
+            sb.pause()
+        elif a.cmd == "resume":
+            sb.resume()
+        elif a.cmd == "renew":
+            sb.renew(a.seconds)
         else:
-            return sb.exec(" ".join(a.command), timeout=a.timeout, on_output=lambda t: print(t, end="", flush=True)).returncode
+            return sb.exec(" ".join(a.command), timeout=a.timeout, env=_env_args(p, a.env) or None, cwd=a.cwd,
+                           on_output=lambda t: print(t, end="", flush=True)).returncode
     except (SandboxGone, RuntimeError, ValueError, OSError, tarfile.TarError) as e:  # OSError: a local path
         p.error(str(e))
     print("done")
     return 0
 
 
+def _env_args(p, specs):
+    """NAME=VALUE, or NAME to take the value from our own environment (a secret on a command line shows up in `ps`)."""
+    env = {}
+    for spec in specs:
+        name, eq, value = spec.partition("=")
+        if not eq:
+            if name not in os.environ:
+                p.error(f"--env {spec!r}: ${name} is not set")
+            value = os.environ[name]
+        env[name] = value
+    return env
+
+
 def _run(p, a):
+    mounts = {}
+    for spec in a.mount:
+        host, _, dest = spec.rpartition(":")
+        if not (host and dest):
+            p.error(f"--mount {spec!r}: expected HOSTPATH:REMOTE")
+        mounts[host] = dest
     inject = {}
     for spec in a.inject:  # the value comes from the environment: a secret on a command line shows up in `ps` and in logs
         host, _, rest = spec.partition(":")
@@ -111,7 +160,8 @@ def _run(p, a):
     try:
         # lifetime: if this process is killed (a cancelled job) the sandbox still removes itself, on a VM that outlives the job
         with create_sandbox(a.image, host=a.host, limits=Limits(cpus=a.cpus, memory=a.memory, pids=a.pids),
-                            egress=a.egress or None, inject=inject or None, lifetime=a.timeout + 300) as sb:
+                            egress=a.egress or None, inject=inject or None, env=_env_args(p, a.env) or None,
+                            mounts=mounts or None, lifetime=a.timeout + 300) as sb:
             for spec in a.put:
                 local, _, remote = spec.rpartition(":")
                 sb.put_dir(local, remote)

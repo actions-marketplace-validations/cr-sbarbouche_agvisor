@@ -1,6 +1,7 @@
 """Runs INSIDE the sandbox, stdlib only: mcp_server.python() sends this file as `python3 -c "$S" <seconds>` with the code on
 stdin. The code runs in one long-lived interpreter, so variables, imports and functions survive between calls.
-`serve` is that interpreter (the client starts it when it isn't up: a unix socket, one call at a time); `kill` stops it."""
+`serve` is that interpreter (the client starts it when it isn't up: a unix socket, one call at a time); `kill` stops it.
+An optional last argument names a context: each context is an interpreter of its own, with its own variables."""
 import ast
 import contextlib
 import os
@@ -11,8 +12,14 @@ import sys
 import time
 import traceback
 
-DIR = os.environ.get("AGVISOR_PYDIR", "/var/tmp/.agvisor-py")  # ponytail: the env var is only for the tests
-SOCK, PID = f"{DIR}/sock", f"{DIR}/pid"
+BASE = os.environ.get("AGVISOR_PYDIR", "/var/tmp/.agvisor-py")  # ponytail: the env var is only for the tests
+DIR = SOCK = PID = None
+
+
+def _where(ctx):  # one directory per context, for its socket and pid file; no context = the original session
+    global DIR, SOCK, PID
+    DIR = f"{BASE}-{ctx}" if ctx else BASE
+    SOCK, PID = f"{DIR}/sock", f"{DIR}/pid"
 
 
 def _connect():
@@ -83,12 +90,12 @@ def serve():
                 pass
 
 
-def client(secs):
+def client(secs, ctx):
     code = sys.stdin.buffer.read()
     s = _connect()
     if s is None:
         print("[new python session: variables from earlier calls are gone]", flush=True)
-        server = subprocess.Popen([sys.executable, "-", "serve"], start_new_session=True,  # this file again, as data on stdin
+        server = subprocess.Popen([sys.executable, "-", "serve", ctx], start_new_session=True,  # this file again, as data on stdin
                                   stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         server.stdin.write(os.environ["S"].encode())
         server.stdin.close()
@@ -114,4 +121,6 @@ def kill():
 
 
 if __name__ == "__main__":
-    {"serve": serve, "kill": kill}.get(sys.argv[1], lambda: client(int(sys.argv[1])))()
+    cmd, ctx = sys.argv[1], sys.argv[2] if len(sys.argv) > 2 else ""
+    _where(ctx)
+    {"serve": serve, "kill": kill}.get(cmd, lambda: client(int(cmd), ctx))()

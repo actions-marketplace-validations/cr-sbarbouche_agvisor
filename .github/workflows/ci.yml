@@ -180,7 +180,7 @@ jobs:
           rc=0
           for f in examples/*.py; do
             echo "::group::$f"
-            uv run --locked python "$f" || { echo "::error::$f failed"; rc=1; }
+            uv run --locked --extra inject python "$f" || { echo "::error::$f failed"; rc=1; }  # 10_agent_cli.py injects a key
             echo "::endgroup::"
           done
           exit $rc

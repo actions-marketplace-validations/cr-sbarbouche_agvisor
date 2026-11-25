@@ -8,6 +8,11 @@ Entry grammar, `host[:port]`: port defaults to 80 and 443, `*` = any port.
   1.2.3.4          an IPv4 address           10.0.0.0/24     an IPv4 network
 A name only gets through if it resolves to public addresses: a name is not a way to reach 10.x, the host or the cloud
 metadata endpoint. Reaching a private address takes an entry that says so (an IP or a network).
+`!entry` is a deny: it wins over every allow, and its port defaults to any (`!admin.example.com` shuts out all of it).
+
+The rules live in a file on a tmpfs (RULES_FILE), written at start from AGVISOR_ALLOW. `python -c <this file> edit` changes
+them from outside (ops on stdin: `allow ENTRY`, `deny ENTRY`) and signals PID 1 (this proxy), which reloads them on SIGHUP
+and closes the open tunnels that the new rules no longer let through.
 
 Credentials: for a host named in AGVISOR_INJECT, a CONNECT to port 443 is not a blind tunnel. The proxy ends the client's
 TLS with its own certificate (AGVISOR_TLS, which the client was told to trust), checks the request, sets the configured
@@ -21,13 +26,16 @@ import ipaddress
 import json
 import os
 import re
+import signal
 import socket
 import ssl
+import sys
 import tempfile
 import time
 from urllib.parse import urlsplit
 
 PORT = 3128
+RULES_FILE = "/run/agvisor/rules"  # one entry per line; on a tmpfs, because the proxy's own root is read-only
 _MAX = 256  # concurrent connections; the container's memory is the real limit
 _IDLE = 900  # seconds a tunnel may carry no byte in either direction before it is closed: longer than a quiet request is expected to take
 _NAME = re.compile(r"(\*\.)?[a-z0-9]([a-z0-9-]*[a-z0-9])?(\.[a-z0-9]([a-z0-9-]*[a-z0-9])?)*")
@@ -54,6 +62,19 @@ def parse_rules(entries):
         else:
             raise ValueError(f"invalid egress entry {e!r}: expected host[:port], *.host[:port], an IPv4 address or network")
     return rules
+
+
+def parse_policy(entries):
+    """(allow, deny): parse_rules' tuples for the entries that let a host through, and for the `!entry` ones that shut it out.
+    A deny's port defaults to any port, not to 80 and 443: `!example.com` is all of it."""
+    allow, deny = [], []
+    for e in entries:
+        if not e.startswith("!"):
+            allow += parse_rules([e])
+            continue
+        (kind, value, ports), = parse_rules([e[1:]])
+        deny.append((kind, value, ports if ":" in e else None))
+    return allow, deny
 
 
 def parse_inject(inject):
@@ -94,6 +115,39 @@ def match(rules, host, port):
                 return "net"
         elif kind == "name" and (host == val or val.startswith("*.") and host.endswith(val[1:])):
             return "name"
+
+
+def check(allow, deny, host, port):
+    """"net" or "name" if (host, port) may be reached: some allow rule lets it through and no deny rule names it."""
+    if not match(deny, host, port):
+        return match(allow, host, port)
+
+
+def drop(tunnels, allow, deny):
+    """Close the open tunnels that the rules no longer let through. Their pipes end as if the far side had hung up."""
+    for host, port, cw, uw in list(tunnels):
+        if not check(allow, deny, host, port):
+            cw.close()
+            uw.close()
+
+
+def edit(ops, path=RULES_FILE, pid=1):
+    """Apply [("allow" | "deny", entry)] to the rules file in one step, then tell the proxy (PID 1) to reload. allow(x) removes
+    `x` and `!x` and adds `x`; deny(x) removes both and adds `!x`, so the last word on an entry is the one that stands.
+    ValueError, with nothing written, if the result isn't valid. The file is written whole and renamed over, so the proxy
+    never reads half of it."""
+    with open(path) as f:
+        entries = f.read().split()
+    for op, entry in ops:
+        if op not in ("allow", "deny"):
+            raise ValueError(f"unknown operation {op!r}: allow or deny")
+        entry = entry.lower().removeprefix("!")
+        entries = [e for e in entries if e not in (entry, "!" + entry)] + [entry if op == "allow" else "!" + entry]
+    parse_policy(entries)
+    with open(path + ".new", "w") as f:
+        f.write("".join(e + "\n" for e in entries))
+    os.replace(path + ".new", path)
+    os.kill(pid, signal.SIGHUP)
 
 
 def _public(addr):
@@ -191,9 +245,12 @@ def _server_ctx(pem):
     return ctx
 
 
-async def serve(rules, token, host="0.0.0.0", port=PORT, inject=None, server_ctx=None, upstream_ctx=None):
-    """`inject`: parse_inject()'s result; then `server_ctx` (what the client's TLS ends in) and `upstream_ctx` (how the proxy
+async def serve(rules, token, host="0.0.0.0", port=PORT, inject=None, server_ctx=None, upstream_ctx=None, deny=(), tunnels=None):
+    """`rules` and `deny` are parse_policy()'s lists: change them in place and the next connection follows. `tunnels` is a
+    set that fills with (host, port, client writer, upstream writer) of every open tunnel, for drop().
+    `inject`: parse_inject()'s result; then `server_ctx` (what the client's TLS ends in) and `upstream_ctx` (how the proxy
     verifies the real host) are needed too."""
+    tunnels = set() if tunnels is None else tunnels
     want = b"Basic " + base64.b64encode(f"agvisor:{token}".encode())
     live = 0
     inject = inject or {}
@@ -227,7 +284,7 @@ async def serve(rules, token, host="0.0.0.0", port=PORT, inject=None, server_ctx
                     raise ValueError("bad host")
             except (ValueError, AttributeError):
                 return await _reply(cw, 400, "Bad Request", "agvisor egress proxy: send CONNECT host:port or an absolute http:// URL")
-            kind = match(rules, host, port)
+            kind = check(rules, deny, host, port)
             try:
                 if not kind:
                     raise _Denied(f"{host}:{port} is not in this sandbox's egress allowlist")
@@ -241,6 +298,8 @@ async def serve(rules, token, host="0.0.0.0", port=PORT, inject=None, server_ctx
                 print("fail", host, port, e, flush=True)
                 return await _reply(cw, 502, "Bad Gateway", f"agvisor egress: cannot connect to {host}:{port}: {e}")
             print("allow", host, port, flush=True)
+            tunnel = host, port, cw, uw
+            tunnels.add(tunnel)
             try:
                 if path is None:
                     cw.write(b"HTTP/1.1 200 Connection established\r\n\r\n")
@@ -253,6 +312,7 @@ async def serve(rules, token, host="0.0.0.0", port=PORT, inject=None, server_ctx
                 seen = [time.monotonic()]
                 await asyncio.gather(_pipe(cr, uw, seen), _pipe(ur, cw, seen))
             finally:
+                tunnels.discard(tunnel)
                 uw.close()
         except (OSError, asyncio.IncompleteReadError, asyncio.LimitOverrunError):
             pass  # a client that vanished or sent junk
@@ -269,10 +329,36 @@ async def main():
         inject = parse_inject(json.loads(base64.b64decode(os.environ["AGVISOR_INJECT"])))
         server_ctx = _server_ctx(base64.b64decode(os.environ["AGVISOR_TLS"]).decode())
         upstream_ctx = ssl.create_default_context()
-    server = await serve(parse_rules(os.environ["AGVISOR_ALLOW"].split(",")), os.environ["AGVISOR_TOKEN"],
-                         inject=inject, server_ctx=server_ctx, upstream_ctx=upstream_ctx)
+    path = os.environ.get("AGVISOR_RULES", RULES_FILE)  # ponytail: the env var is only for the tests
+    entries = [e.lower() for e in os.environ["AGVISOR_ALLOW"].split(",")]
+    allow, deny = parse_policy(entries)
+    with open(path, "w") as f:  # what edit() changes, and what the host reads back
+        f.write("".join(e + "\n" for e in entries))
+    tunnels = set()
+
+    def reload():  # SIGHUP: edit() wrote a new file
+        try:
+            with open(path) as f:
+                new_allow, new_deny = parse_policy(f.read().split())
+        except (OSError, ValueError) as e:  # keep the rules we have: a bad file must not open the sandbox up, or shut it
+            print("reload failed, keeping the old rules:", e, flush=True)
+            return
+        allow[:], deny[:] = new_allow, new_deny
+        drop(tunnels, allow, deny)
+        print("reload", len(allow), "allow", len(deny), "deny", flush=True)
+
+    asyncio.get_running_loop().add_signal_handler(signal.SIGHUP, reload)
+    server = await serve(allow, os.environ["AGVISOR_TOKEN"], port=int(os.environ.get("AGVISOR_PORT", PORT)),  # ponytail: the port is only for the tests
+                         inject=inject, server_ctx=server_ctx, upstream_ctx=upstream_ctx, deny=deny, tunnels=tunnels)
     await server.serve_forever()
 
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    if sys.argv[1:2] == ["edit"]:  # `python -c <this file> edit`, run by Sandbox.allow() / deny() inside the proxy's container
+        try:
+            edit([tuple(l.split(" ", 1)) for l in sys.stdin.read().splitlines() if l], pid=int(os.environ.get("AGVISOR_PID", 1)),
+                 path=os.environ.get("AGVISOR_RULES", RULES_FILE))
+        except ValueError as e:
+            sys.exit(f"agvisor egress: {e}")
+    else:
+        asyncio.run(main())
