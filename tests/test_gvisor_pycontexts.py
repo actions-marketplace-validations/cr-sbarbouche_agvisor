@@ -45,7 +45,7 @@ with create_sandbox(image, host=host, idle_ttl=120, lifetime=600) as sb:
         except ValueError:
             continue
         raise AssertionError(f"accepted {bad!r}")
-    assert sb.exec("test ! -e /tmp/pwned").returncode == 0
+    assert sb.exec("test ! -e /tmp/pwned", timeout=30).returncode == 0
 
 # the MCP tool, with a context
 os.environ.update(AGVISOR_NETWORK="none", AGVISOR_IDLE_TTL="120", AGVISOR_LIFETIME="600")
