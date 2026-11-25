@@ -834,9 +834,9 @@ class Sandbox:
 
     def pause(self):
         """Freeze every process in the sandbox until resume(): no CPU, nothing runs, and exec() raises SandboxPaused. It
-        is a freeze, not a checkpoint: the memory (RAM, /tmp) stays held. Clocks go on: `lifetime` keeps counting (not
-        checked whether gVisor's stops it), and resume() restarts the `idle_ttl` clock, so a sandbox that waited longer
-        than that doesn't expire the moment it wakes. RuntimeError, with docker's words, if it is already paused or not running."""
+        is a freeze, not a checkpoint: the memory (RAM, /tmp) stays held. Clocks go on: `lifetime` keeps counting (on real
+        gVisor a sandbox paused past its lifetime is gone when resumed), while `idle_ttl` is restarted by resume() and the
+        watchdog, so a sandbox that waited longer than that doesn't expire the moment it wakes. RuntimeError, with docker's words, if it is already paused or not running."""
         self._docker("pause", self.name)
         self._paused = True
 
