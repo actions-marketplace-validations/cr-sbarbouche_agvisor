@@ -7,17 +7,18 @@ description: "Run untrusted or risky code in a gVisor sandbox instead of on the 
 
 gVisor (`runsc`) sandboxes with CPU/memory/pids/disk limits, driven through the `docker` CLI. Alpha, not security-audited: tell the user that before running code that is actively hostile.
 
-## With the `agvisor` MCP tools (`run`, `write_file`, `read_file`, `edit_file`, `python`, `list_files`, `start_job`, `job_output`, `kill_job`, `reset`, `stats`; `snapshot`, `restore` when the user set `AGVISOR_NAME`; `port` when they set `AGVISOR_PORTS`)
+## With the `agvisor` MCP tools (`run`, `write_file`, `read_file`, `edit_file`, `python`, `list_files`, `start_job`, `job_output`, `kill_job`, `reset`, `stats`; `snapshot`, `restore` when the user set `AGVISOR_NAME`; `port` when they set `AGVISOR_PORTS`; `egress_blocked` when they set `AGVISOR_EGRESS` or `AGVISOR_INJECT`)
 
 - Use `run` for every command that executes code you did not write or cannot vouch for. If it fails, tell the user. Don't fall back to the host shell.
 - One sandbox lives between calls (files, installed packages) until it has been idle ~10 minutes. Then `run` reports "sandbox was reset" and the files are gone: set up again.
 - It can't see the user's files, except a directory the user copied in on purpose (they will say where; look with `list_files`). Put code in with `write_file` (an absolute path such as `/tmp/a.py`; there is no `/workspace` here), print what you need back.
-- Network is off unless the user set `AGVISOR_NETWORK`, or limited to a few hosts if they set `AGVISOR_EGRESS` (a 403 saying "not in this sandbox's egress allowlist" means the host isn't one of them). If `pip install` fails for that reason, ask them. Don't work around it.
+- Network is off unless the user set `AGVISOR_NETWORK`, or limited to a few hosts if they set `AGVISOR_EGRESS` (a 403 saying "not in this sandbox's egress allowlist" means the host isn't one of them). If `pip install` fails for that reason, call `egress_blocked` (the hosts it was refused, as `host:port`), tell the user which one you need and why: they can allow it while the sandbox runs, and you can't. Don't work around it.
 - If the user set `AGVISOR_INJECT`, requests to those hosts get their credential added outside the sandbox: send them without any key, and don't ask for it. You can't read it.
 - If `port` exists, a server you start with `start_job` on one of those ports can be opened by the user: call `port(container_port)` and give them the address. Inside the sandbox it is `localhost:<container_port>`.
 - A command that vanished or a `sandbox was reset` can mean it ran out of memory or processes: `stats` shows use against the limits (memory counts `/tmp`, which is RAM).
+- The user may have shown you a host directory read-only (`AGVISOR_MOUNTS`, they will say where): read it with `run`/`list_files`, but you can't change it. Copy what you need to edit into `/tmp`.
 - Change part of a file with `edit_file(path, old, new)` (`old` must appear exactly once), not by sending the whole file again.
-- For data analysis or anything you explore step by step, use `python(code)`: variables and imports stay between calls, and the last expression is printed. It needs python3 in the image; if it says so, tell the user. `restart=True` clears it.
+- For data analysis or anything you explore step by step, use `python(code)`: variables and imports stay between calls, and the last expression is printed. It needs python3 in the image; if it says so, tell the user. `restart=True` clears it. `context="name"` is a separate session with its own variables, for work on several things at once; don't open many, they share the sandbox's memory.
 - `run` stops at its `timeout` (and the sandbox's idle limit). For anything longer (a scan, a build, a server) use `start_job`, then `job_output(job_id, offset)` with the offset it returned, until it says `[exit N`. Poll at least every few minutes: a sandbox that nobody calls is deleted, running job included.
 - Going over memory or the process limit kills the whole sandbox, not one process. Expect "sandbox was reset".
 - With the snapshot tools: `/workspace` is kept across resets. Call `snapshot(tag)` before a risky install or rewrite, `restore(tag)` to undo it (it erases the current `/workspace`; the snapshot stays). `list_snapshots` shows the tags. Only a few can exist: `delete_snapshot(tag)` frees a slot.
@@ -39,4 +40,5 @@ with create_sandbox(limits=Limits(cpus=1, memory="512m"), network="none", lifeti
 - Use Debian/Ubuntu images (`ubuntu:24.04`, `python:3.12-slim`): timeouts need GNU `timeout`. An image's `ENTRYPOINT` is ignored.
 - Keep `pids` at the default 512: gVisor counts host threads, and 64-128 made fork storms kill the sandbox.
 - `network="none"` for untrusted code. On a cloud VM, `"bridge"` can reach the metadata endpoint and steal the VM's credentials.
+- `create_sandbox(env={...})` and `exec(env=, cwd=)` set variables; `mounts={"/host/dir": "/dir"}` shows a host directory read-only. `sb.pause()` / `sb.resume()` freeze and thaw it. `sb.renew(seconds)` moves `lifetime` (only with `renewable=True`, which lets code inside extend its own life). With `egress=`: `sb.allow(host)`, `sb.deny(host)`, `sb.egress_denied()` change and read the allowlist while it runs; `!host` in `egress=` is a deny.
 - The `/workspace` volume of a named sandbox has no size cap. `sb.snapshot(tag)` / `sb.restore(tag)` save and roll back `/workspace`; `sb.list_snapshots()`, `sb.delete_snapshot(tag)`.

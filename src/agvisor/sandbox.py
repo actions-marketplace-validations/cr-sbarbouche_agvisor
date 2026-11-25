@@ -1,15 +1,18 @@
 import base64
 import codecs
 import collections
+import contextlib
 import io
 import json
 import math
 import os
+import posixpath
 import re
 import secrets
 import shlex
 import subprocess
 import tarfile
+import tempfile
 import time
 import uuid
 from datetime import datetime, timezone
@@ -23,6 +26,7 @@ _ID = r"[A-Za-z0-9][A-Za-z0-9_.-]{0,62}"  # name= and owner=: they end up in --n
 _TAG = r"[A-Za-z0-9][A-Za-z0-9_-]{0,31}"  # snapshot tag: no '.', so a snapshot's volume name splits unambiguously into name.tag
 _KEEP = 100_000  # exec(on_output=) keeps only this many trailing characters: the rest already went to on_output
 _MARK = "/tmp/.agvisor_active"  # idle_ttl: every exec() touches it; PID 1 exits once it is older than idle_ttl
+_DEADLINE = "/tmp/.agvisor_deadline"  # renewable=True: the epoch second at which PID 1 ends the sandbox; renew() rewrites it
 # gui: RDP checks GNOME Remote Desktop's own credentials file, which the image bakes as gnome:gnome, NOT the unix
 # password. Run as GUI_USER with the file on stdin and its path as $1: store ours, wait for the desktop to boot
 # (up to 120 s), restart the RDP service (it reads the file only at startup), wait until it listens on 3389 (0D3D).
@@ -66,11 +70,11 @@ _RUNC = ("runc", "io.containerd.runc.v2")  # --privileged (gui) is only simulate
 _PYSESSION = Path(__file__).with_name("_pysession.py").read_text()  # python(): sent along with every call
 
 
-def _py(arg, max_bytes):
-    """_pysession.py as a shell command (`arg`: the call's seconds, or "kill"). Its output is cut to max_bytes in the
-    sandbox: it is untrusted, and exec(input=) holds everything it prints in memory."""
+def _py(arg, max_bytes, context=None):
+    """_pysession.py as a shell command (`arg`: the call's seconds, or "kill"; `context`: a name that passed _TAG). Its
+    output is cut to max_bytes in the sandbox: it is untrusted, and exec(input=) holds everything it prints in memory."""
     return (f"command -v python3 >/dev/null || {{ echo 'python3 is not in this sandbox image (python:3.12-slim has it)'; exit 127; }}; "
-            f"S={shlex.quote(_PYSESSION)}; export S; python3 -c \"$S\" {arg} 2>&1 | tail -c {int(max_bytes)}")
+            f"S={shlex.quote(_PYSESSION)}; export S; python3 -c \"$S\" {arg}{f' {context}' if context else ''} 2>&1 | tail -c {int(max_bytes)}")
 
 
 def _bytes(text):  # docker's "20.6MiB", "2GiB", "0B"
@@ -78,10 +82,75 @@ def _bytes(text):  # docker's "20.6MiB", "2GiB", "0B"
     return round(float(n) * 1024 ** "BKMGTP".index(unit[0]))
 
 
+_VAR = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+
+
+def _env_text(env):
+    """env={NAME: value} as the text of a docker env-file, checked. One line per variable, so a value can't hold a newline
+    (it would start a second variable). A value never appears in an error message: it may be a secret."""
+    if not isinstance(env, dict) or not env:
+        raise ValueError("env must be a non-empty dict {NAME: value}")
+    for k, v in env.items():
+        if not isinstance(k, str) or not _VAR.fullmatch(k):
+            raise ValueError(f"invalid environment variable name {k!r}: letters, digits and '_', not starting with a digit")
+        if not isinstance(v, str) or any(c in v for c in "\r\n\0"):
+            raise ValueError(f"environment variable {k}: the value must be text on one line")
+    return "".join(f"{k}={v}\n" for k, v in env.items())
+
+
+@contextlib.contextmanager
+def _exec_opts(env, cwd):
+    """The `docker exec` flags for exec(env=, cwd=). The environment goes through a file that only we can read, not
+    through `-e`: a command line shows up in `ps` on the machine that runs the docker client."""
+    opts = []
+    if cwd is not None:
+        if not isinstance(cwd, str) or not cwd.startswith("/") or "\0" in cwd:
+            raise ValueError(f"cwd must be an absolute path, got {cwd!r}")
+        opts += ["-w", cwd]
+    if not env:
+        yield opts
+        return
+    text = _env_text(env)
+    with tempfile.NamedTemporaryFile("w", suffix=".env") as f:  # mkstemp: mode 0600
+        f.write(text)
+        f.flush()
+        yield [*opts, f"--env-file={f.name}"]
+
+
+def _mount_paths(mounts):
+    """mounts={host path: path inside} as [(source, destination)], checked. Absolute paths, normalised, no `..`. Never `/`,
+    and nothing under /proc, /sys or /dev; a source is not under /run or /var/run either, nor a `*.sock`: handing a
+    docker socket to a sandbox hands over the host. A guard against mistakes by whoever chose the paths, not against them:
+    they decide what is shared."""
+    if not isinstance(mounts, dict) or not mounts:
+        raise ValueError("mounts must be a non-empty dict {path on the docker host: path inside the sandbox}")
+    out, seen = [], set()
+    for src, dst in mounts.items():
+        for what, path in (("source", src), ("destination", dst)):
+            if not isinstance(path, str) or not path.startswith("/") or re.search(r'[,"\x00-\x1f]', path) or ".." in path.split("/"):
+                raise ValueError(f"invalid mount {what} {path!r}: an absolute path with no '..', ',', '\"' or control characters")
+        src, dst = posixpath.normpath(src), posixpath.normpath(dst)
+        # normpath keeps a leading '//' (POSIX): both are plain absolute paths for docker either way
+        under = lambda path, *roots: any(path == r or path.startswith(r + "/") for r in roots)
+        if src.startswith("//") or dst.startswith("//") or src == "/" or dst == "/":
+            raise ValueError("the root directory can't be mounted, or mounted over")
+        if under(src, "/proc", "/sys", "/dev", "/run", "/var/run") or src.endswith(".sock") or under(dst, "/proc", "/sys", "/dev"):
+            raise ValueError(f"won't mount {src} onto {dst}: not from /proc, /sys, /dev, /run, /var/run or a socket, and not onto /proc, /sys or /dev")
+        if dst in seen:
+            raise ValueError(f"two mounts onto {dst}")
+        seen.add(dst)
+        out.append((src, dst))
+    return out
+
+
 class SandboxGone(RuntimeError):
     """exec() found the container dead or deleted: killed for going over memory/pids, expired (lifetime/idle_ttl), or
     removed. It is not a failed command. Named sandboxes: create_sandbox(name=...) again gives a fresh container on
     the same volume."""
+
+
+class SandboxPaused(RuntimeError):
+    """exec() found the container paused (Sandbox.pause()): resume() it first. It is not a failed command."""
 
 
 class Job:
@@ -155,7 +224,8 @@ class Sandbox:
     """host=None -> local docker; host="ssh://user@vm" -> docker on a remote VM/server."""
 
     def __init__(self, image=None, *, gui=False, limits=Limits(), network="bridge", lifetime=None,
-                 idle_ttl=None, name=None, owner=None, host=None, runtime="runsc", egress=None, inject=None, ports=None):
+                 idle_ttl=None, name=None, owner=None, host=None, runtime="runsc", egress=None, inject=None, ports=None,
+                 env=None, renewable=False, mounts=None):
         self.gui, self.limits, self.network, self.lifetime, self.host = gui, limits, network, lifetime, host
         self.idle_ttl, self.runtime = idle_ttl, runtime
         # strict like `name`: it ends up in --runtime=. And never plain runc for a gui: it is run --privileged
@@ -168,6 +238,9 @@ class Sandbox:
             raise ValueError("lifetime must be > 0 seconds and is only supported for headless sandboxes")
         if idle_ttl is not None and (gui or idle_ttl <= 0):
             raise ValueError("idle_ttl must be > 0 seconds and is only supported for headless sandboxes")
+        if renewable and not lifetime:
+            raise ValueError("renewable=True needs lifetime=: it is the lifetime that renew() moves")
+        self.renewable = renewable
         # strict: `name` ends up in --name and --volume, where a ',' or ':' would inject mount options
         if name is not None and not re.fullmatch(_ID, name):
             raise ValueError(f"invalid name {name!r}: letters, digits, '_', '.', '-' only (max 63)")
@@ -186,7 +259,8 @@ class Sandbox:
             egress = list(egress)
             if not egress:
                 raise ValueError("egress is empty: that is network='none'")
-            egress_proxy.parse_rules(egress)  # raises ValueError on an entry it can't use
+            if not egress_proxy.parse_policy(egress)[0]:  # raises ValueError on an entry it can't use
+                raise ValueError("egress has only '!' entries: nothing is allowed, which is network='none'")
         if ports is not None:
             ports = list(ports)
             if not ports or len(set(ports)) != len(ports) or any(type(p) is not int or not 0 < p < 65536 for p in ports):
@@ -194,6 +268,10 @@ class Sandbox:
             if gui or network == "none" or egress is not None:  # docker publishes through the bridge: neither of these has a route in
                 raise ValueError("ports= needs a network the host can reach: headless only, not network='none', egress= or inject=")
         self.ports = ports
+        self.mounts = _mount_paths(mounts) if mounts is not None else None
+        if env is not None:
+            _env_text(env)  # raises ValueError: a bad one is an error now, not a failed `docker run`
+        self.env = env
         self.egress, self._has_egress = egress, egress is not None  # _has_egress: also true for handles from list_sandboxes()
         self.inject, self._ca = inject, None  # _ca: the certificate the sandbox must trust, made by _egress_up()
         self.owner = owner
@@ -203,6 +281,7 @@ class Sandbox:
         self.data_dir = (GUI_HOME if gui else "/workspace") if self.persistent else None  # survives stop()
         self.rdp_port = self.password = None  # set by start() when gui; user is GUI_USER
         self._running = False
+        self._paused = False  # only list_sandboxes() knows: a handle from create_sandbox() doesn't track it
 
     def _docker(self, *args, input=None, check=True):
         cmd = ["docker", *(["-H", self.host] if self.host else []), *args]
@@ -242,7 +321,9 @@ class Sandbox:
         if self.persistent:
             a.append(f"--label=agvisor.name={self.name.removeprefix('agvisor-')}")
         if self.egress:
-            a += ["--label=agvisor.egress=1", "--env-file=/dev/stdin"]  # the proxy password rides on stdin, not on a command line
+            a.append("--label=agvisor.egress=1")
+        if self.egress or self.env:  # the proxy password and env= ride on stdin, not on a command line
+            a.append("--env-file=/dev/stdin")
         if self.data_dir:  # a docker volume is a host directory: it is outside gVisor's discarded rootfs overlay
             a.append(f"--volume={self.name}:{self.data_dir}")
             if not self.gui:
@@ -252,6 +333,8 @@ class Sandbox:
         elif l.shm:
             a.append(f"--shm-size={l.shm}")
         a += [f"--publish=127.0.0.1::{p}" for p in self.ports or ()]  # a random free port on the docker host's loopback
+        # --mount, not -v: a missing source is an error, not a directory that docker makes (owned by root) and mounts
+        a += [f"--mount=type=bind,source={src},target={dst},readonly" for src, dst in self.mounts or ()]
         if not self.gui:  # PID 1 is `sleep`, which never reaps orphans: they stay zombies and eat the pids limit
             a.append("--init")  # (gui: systemd is PID 1 and reaps)
             # an image ENTRYPOINT would swallow our PID 1 command as its arguments. exec() bypasses it anyway, so
@@ -259,15 +342,33 @@ class Sandbox:
             a.append("--entrypoint=")
         return a + [self.image] + self._pid1()
 
+    def _watch_renewable(self):
+        """PID 1 of a renewable sandbox: one loop that ends it when the deadline file says so (renew() rewrites that
+        file), or when it has been idle for idle_ttl. It sleeps at most 5 s at a time, and never past the deadline it saw."""
+        idle = self.idle_ttl
+        return "; ".join([
+            f"echo $(( $(date +%s) + {self.lifetime} )) > {_DEADLINE}", *([f"touch {_MARK}", "t=$(date +%s)"] if idle else []),
+            "while :", "do n=$(date +%s)",
+            # a pass that took 15+ s means the sandbox was frozen (pause()): not idleness, as in _pid1()
+            *([f"[ $((n - t)) -gt 15 ] && touch {_MARK}"] if idle else []),
+            f"r=$(( $(cat {_DEADLINE} 2>/dev/null) - n ))",  # a missing or empty file is a deadline long past
+            "[ $r -gt 0 ] || break",
+            *([f"[ $(( n - $(stat -c %Y {_MARK} 2>/dev/null || echo 0) )) -lt {idle} ] || break", "t=$n"] if idle else []),
+            "[ $r -gt 5 ] && r=5", "sleep $r", "done"])
+
     def _pid1(self):
         if self.gui:
             return []
+        if self.renewable:
+            return ["sh", "-c", self._watch_renewable()]
         if not self.idle_ttl:
             return ["sleep", str(self.lifetime or "infinity")]
         # exits when the marker is older than idle_ttl (checked every 5s); a missing marker counts as expired.
         # `timeout` adds lifetime as a hard cap on top.
-        watch = (f"touch {_MARK}; while [ $(( $(date +%s) - $(stat -c %Y {_MARK} 2>/dev/null || echo 0) )) "
-                 f"-lt {self.idle_ttl} ]; do sleep 5; done")
+        # A `sleep 5` that took 15+ s means the sandbox was frozen (pause()): that was not idleness, so touch the marker
+        # before the check, or a sandbox parked for longer than idle_ttl would expire the moment it wakes.
+        watch = (f"touch {_MARK}; t=$(date +%s); while [ $(( $(date +%s) - $(stat -c %Y {_MARK} 2>/dev/null || echo 0) )) "
+                 f"-lt {self.idle_ttl} ]; do sleep 5; n=$(date +%s); [ $((n - t)) -gt 15 ] && touch {_MARK}; t=$n; done")
         return (["timeout", str(self.lifetime)] if self.lifetime else []) + ["sh", "-c", watch]
 
     def _left_running(self):
@@ -313,11 +414,13 @@ class Sandbox:
         """egress=: a private network with no route out, and on it a proxy that only lets the allowlist through. The
         proxy is the one thing the sandbox can reach, and also on the default bridge. Returns the sandbox's env-file.
         The sandbox gets the proxy's IP: docker's embedded DNS (127.0.0.11) does not work under gVisor."""
-        pairs, tmpfs, b64 = [("AGVISOR_ALLOW", ",".join(self.egress))], [], lambda t: base64.b64encode(t.encode()).decode()
+        # /run/agvisor: where the proxy keeps its rules (the root is read-only), and where allow() and deny() rewrite them
+        pairs, b64 = [("AGVISOR_ALLOW", ",".join(self.egress))], lambda t: base64.b64encode(t.encode()).decode()
+        tmpfs = ["--tmpfs=/run/agvisor:rw,noexec,nosuid,size=64k,uid=65534,gid=65534,mode=700"]
         if self.inject:  # before anything is started: no cryptography package is an error with nothing to clean up
             self._ca, proxy_pem = _ca.make(list(self.inject))
             pairs += [("AGVISOR_INJECT", b64(json.dumps(self.inject))), ("AGVISOR_TLS", b64(proxy_pem))]  # one line each: env-file
-            tmpfs = ["--tmpfs=/tmp:rw,noexec,nosuid,size=1m,mode=1777"]  # where the proxy loads its key from: the root is read-only
+            tmpfs.append("--tmpfs=/tmp:rw,noexec,nosuid,size=1m,mode=1777")  # where the proxy loads its key from: the root is read-only
         self._gc_egress()
         if self.persistent:  # leftovers of an earlier session of this name
             self._docker("rm", "-f", self._proxy, check=False)
@@ -390,8 +493,9 @@ class Sandbox:
             if self.network == "isolated":
                 self._isolated_up()
             try:
-                env = self._egress_up() if self.egress else None
-                self._docker(*self.run_args(), input=env)
+                # env= first: if it sets HTTPS_PROXY too, the proxy's own value comes later and wins
+                env = (_env_text(self.env) if self.env else "") + (self._egress_up() if self.egress else "")
+                self._docker(*self.run_args(), input=env or None)
             except BaseException:
                 if self.egress:
                     self._egress_down()
@@ -440,10 +544,12 @@ class Sandbox:
         return {"cpu": float(row["CPUPerc"].rstrip("%")), "memory": _bytes(used), "memory_limit": _bytes(limit),
                 "pids": int(row["PIDs"])}
 
-    def exec(self, cmd, *, input=None, timeout=120, on_output=None):
+    def exec(self, cmd, *, input=None, timeout=120, on_output=None, env=None, cwd=None):
         """Run a shell command inside. Returns CompletedProcess; returncode 124 = timed out.
         `on_output(text)` is called with output as it is produced (stderr merged into stdout, which then holds
         only the last ~100 KB; it must not raise, and can't be combined with `input`).
+        `env={NAME: value}` adds variables for this command only (they go through a private file, not a command line,
+        so a secret doesn't show in `ps`); `cwd` is the absolute directory to start in.
         That needs GNU `timeout`, i.e. a Debian/Ubuntu-based image. Alpine's busybox returns 143 instead and kills
         only the shell: the children of a compound command (`a; b`) keep running."""
         if self.idle_ttl:
@@ -453,14 +559,15 @@ class Sandbox:
             # activity = an exec starting or ending (the trap also fires on `exit`)
             cmd = f"trap 'touch {_MARK} 2>/dev/null' EXIT; touch {_MARK} 2>/dev/null; {cmd}"
         argv = ["timeout", "-k", "5", str(timeout), "sh", "-c", cmd]  # kills inside, not just the client
-        if on_output:
-            if input is not None:
-                raise ValueError("on_output can't be combined with input")
-            r = self._stream("exec", "-i", self.name, *argv, on_output=on_output)
-            msg = r.stdout  # _stream merges stderr into stdout
-        else:
-            r = self._docker("exec", "-i", self.name, *argv, input=input, check=False)
-            msg = r.stderr
+        if on_output and input is not None:
+            raise ValueError("on_output can't be combined with input")
+        with _exec_opts(env, cwd) as opts:
+            if on_output:
+                r = self._stream("exec", "-i", *opts, self.name, *argv, on_output=on_output)
+                msg = r.stdout  # _stream merges stderr into stdout
+            else:
+                r = self._docker("exec", "-i", *opts, self.name, *argv, input=input, check=False)
+                msg = r.stderr
         # ponytail: matches message text. "is not running" and "WaitPID" were seen on a real gVisor VM; "Error response
         # from daemon" and "No such container" are docker's standard wording, not re-checked there. The prefix is
         # required for the first two so a command printing "nginx is not running" isn't mistaken for a dead sandbox.
@@ -468,41 +575,49 @@ class Sandbox:
         if r.returncode in (1, 128) and ("waitpid" in msg or "error response from daemon" in msg
                                          and ("is not running" in msg or "no such container" in msg)):
             raise SandboxGone(f"{self.name} is gone: {msg.strip()[-300:]}")
+        if r.returncode == 1 and "error response from daemon" in msg and "is paused" in msg:  # docker: "Container ... is paused, unpause the container before exec"
+            raise SandboxPaused(f"{self.name} is paused: resume() it first")
         return r
 
     def _short(self):  # an exec() that only looks at files: well under idle_ttl, whatever it is
         return min(30, self.idle_ttl - 7) if self.idle_ttl else 30
 
-    def spawn(self, cmd, *, timeout=None):
+    def spawn(self, cmd, *, timeout=None, env=None, cwd=None):
         """Start `sh -c cmd` in the background and return a Job at once, for what outlives a single exec(): a long scan, a
         dev server. `timeout` kills it after that many seconds; the default is to run until it ends, is kill()ed or the
         sandbox goes. exec(timeout=) must stay under idle_ttl, a background job doesn't have to, but nothing keeps the
-        sandbox alive for it either: poll() it, or set `lifetime` for a hard budget. Same image requirements as exec()."""
+        sandbox alive for it either: poll() it, or set `lifetime` for a hard budget. Same image requirements as exec().
+        `env` and `cwd` are exec()'s: the job starts with them."""
         if timeout is not None and timeout <= 0:
             raise ValueError("timeout must be > 0 seconds")
         job = Job(self, uuid.uuid4().hex[:12])
         d = shlex.quote(job._d)
         r = self.exec(f"mkdir -p {d} && {{ sh -c {shlex.quote(_JOB)} {d} {shlex.quote(cmd)} {int(timeout or 0)} >/dev/null 2>&1 </dev/null & }}; "
-                      f"for i in $(seq 50); do [ -s {d}/pid ] && exit 0; sleep 0.1; done; exit 1", timeout=self._short())
+                      f"for i in $(seq 50); do [ -s {d}/pid ] && exit 0; sleep 0.1; done; exit 1", timeout=self._short(), env=env, cwd=cwd)
         if r.returncode:
             raise RuntimeError(f"spawn failed (exit {r.returncode}): {r.stderr.strip()[-300:]}")
         return job
 
-    def python(self, code, *, timeout=60, restart=False, max_bytes=30_000):
+    def python(self, code, *, timeout=60, restart=False, max_bytes=30_000, context=None):
         """Run Python `code` in a session that keeps variables, imports and functions between calls, like notebook cells:
         one long-lived interpreter inside, so the image needs python3. The value of a last expression is printed.
         Returns a CompletedProcess: stdout is what the code printed, stderr merged, the last `max_bytes` of it. A Python
         exception is a traceback in stdout, not a return code. At `timeout` seconds the code gets a TimeoutError and
         the session survives; stuck where that can't reach it (a C call), the session is killed and returncode is 124.
         127 = no python3 in the image. `restart` kills the session first. The session goes with the container. Same
-        limits as exec(): timeout + 5 must stay under idle_ttl, GNU coreutils in the image."""
+        limits as exec(): timeout + 5 must stay under idle_ttl, GNU coreutils in the image.
+        `context` names a session: each name is an interpreter of its own (variables, imports), so two analyses don't
+        share globals; None is the original one. Letters, digits, '_' and '-' (up to 32). Each costs the memory of an
+        idle interpreter until the sandbox ends: they all count in limits.memory. `restart` and the timeout kill only that one."""
         if timeout < 1:
             raise ValueError("timeout must be >= 1 second")
+        if context is not None and not (isinstance(context, str) and re.fullmatch(_TAG, context)):
+            raise ValueError(f"invalid python context {context!r}: letters, digits, '_', '-' only (max 32)")
         if restart:
-            self.exec(_py("kill", max_bytes), timeout=self._short())
-        r = self.exec(_py(int(timeout), max_bytes), input=code, timeout=int(timeout) + 5)  # the alarm fires 5 s before this
+            self.exec(_py("kill", max_bytes, context), timeout=self._short())
+        r = self.exec(_py(int(timeout), max_bytes, context), input=code, timeout=int(timeout) + 5)  # the alarm fires 5 s before this
         if r.returncode == 124:
-            self.exec(_py("kill", max_bytes), timeout=self._short())
+            self.exec(_py("kill", max_bytes, context), timeout=self._short())
         return r
 
     def put(self, path, data: bytes, *, timeout=120):
@@ -636,6 +751,90 @@ class Sandbox:
             raise RuntimeError(f"can't pause {self.name} to copy its data: {r.stderr.strip()}")
         return not r.returncode
 
+    def _proxy_exec(self, *args, input=None):
+        """Run a command in the egress proxy's container: its stdout. SandboxGone if the proxy is gone (the sandbox expired
+        and `agvisor prune` took it)."""
+        r = self._docker("exec", "-i", self._proxy, *args, input=input, check=False)
+        if r.returncode:
+            err = r.stderr.strip()
+            if "no such container" in err.lower() or "is not running" in err.lower():
+                raise SandboxGone(f"the egress proxy of {self.name} is gone: {err[-300:]}")
+            raise RuntimeError(err[-300:] or f"exit {r.returncode}")
+        return r.stdout
+
+    def _egress_edit(self, op, entries):
+        if not self._has_egress:
+            raise ValueError(f"{self.name} has no egress allowlist to change: create it with egress=[...]")
+        if not entries:
+            raise ValueError("give at least one entry")
+        egress_proxy.parse_rules(entries)  # raises ValueError for one the proxy would refuse, '!...' included
+        self._proxy_exec("python", "-c", Path(egress_proxy.__file__).read_text(), "edit", input="".join(f"{op} {e}\n" for e in entries))
+
+    def allow(self, *entries):
+        """Let the sandbox reach more hosts, at once, while it runs: the same entries as egress= (`host`, `*.host`, an address or
+        a network, each with an optional `:port`). An entry that was denied is un-denied. Only for a sandbox made with egress=
+        (or inject=). Applies to new connections; ValueError for an entry the proxy would refuse. It is the host's decision
+        to make: don't hand it to the code that runs inside."""
+        self._egress_edit("allow", entries)
+
+    def deny(self, *entries):
+        """Shut hosts out again, at once: the entry is removed from the allowlist and a `!entry` rule that wins over every
+        allow is put in its place, so `deny("admin.example.com")` also carves that name out of an allowed `*.example.com`.
+        A deny without a port means every port. Tunnels that are already open to a host that is no longer allowed are
+        closed, so it takes effect for a download in progress too."""
+        self._egress_edit("deny", entries)
+
+    def egress_rules(self):
+        """The rules in force now, in order: the entries of egress= (plus the hosts of inject=), changed by allow() and deny().
+        A `!entry` is a deny. SandboxGone if the proxy is gone."""
+        if not self._has_egress:
+            raise ValueError(f"{self.name} has no egress allowlist: create it with egress=[...]")
+        return self._proxy_exec("cat", egress_proxy.RULES_FILE).split()
+
+    def egress_denied(self):
+        """What the sandbox tried to reach and the rules refused, as "host:port", in the order it first tried: the list to
+        show whoever decides what to allow(). One that a rule lets through by now is not in it. It reads the proxy's log
+        (one line per connection), which is a few MB for a million connections. SandboxGone if the proxy is gone."""
+        rules = self.egress_rules()
+        allow, deny = egress_proxy.parse_policy(rules)
+        refused = {}
+        for line in self._docker("logs", self._proxy).stdout.splitlines():
+            kind, _, rest = line.partition(" ")
+            host, _, port = rest.partition(" ")
+            if kind == "deny" and port.isdigit() and not egress_proxy.check(allow, deny, host, int(port)):
+                refused[f"{host}:{port}"] = None  # a dict: unique, in first-seen order
+        return list(refused)
+
+    def _unpause(self, check=True):
+        self._docker("unpause", self.name, check=check)
+        if self.idle_ttl:  # the watchdog's clock kept running while its sleep was frozen: don't let that expire us
+            self._docker("exec", self.name, "touch", _MARK, check=False)
+
+    def renew(self, seconds):
+        """Make the sandbox expire `seconds` from now, instead of when its `lifetime` runs out: later or earlier, and
+        as often as you like. Needs create_sandbox(lifetime=..., renewable=True). ValueError if this sandbox isn't
+        renewable. The deadline is a file inside the sandbox (that is how PID 1 sees it), so code running there can extend
+        its own life by writing it: that is why `renewable` is opt-in. A plain `lifetime` stays a hard cap it can't touch."""
+        if type(seconds) is not int or seconds <= 0:
+            raise ValueError("seconds must be a whole number > 0")
+        r = self.exec(f"[ -f {_DEADLINE} ] || exit 3; echo $(( $(date +%s) + {seconds} )) > {_DEADLINE}.new && mv {_DEADLINE}.new {_DEADLINE}",
+                      timeout=self._short())
+        if r.returncode == 3:
+            raise ValueError(f"{self.name} is not renewable: create it with lifetime=... and renewable=True")
+        if r.returncode:
+            raise RuntimeError(f"renew failed (exit {r.returncode}): {r.stderr.strip()[-300:]}")
+
+    def pause(self):
+        """Freeze every process in the sandbox until resume(): no CPU, nothing runs, and exec() raises SandboxPaused. It
+        is a freeze, not a checkpoint: the memory (RAM, /tmp) stays held. Clocks go on: `lifetime` keeps counting (not
+        checked whether gVisor's stops it), and resume() restarts the `idle_ttl` clock, so a sandbox that waited longer
+        than that doesn't expire the moment it wakes. RuntimeError, with docker's words, if it is already paused or not running."""
+        self._docker("pause", self.name)
+
+    def resume(self):
+        """Undo pause(). RuntimeError, with docker's words, if it is not paused."""
+        self._unpause()
+
     def snapshot(self, tag):
         """Save a copy of the data dir (/workspace) as `tag`, replacing a snapshot of that name. Named sandboxes only.
         Kept until delete(). Costs as much disk as the data dir (so at most limits.workspace, if set). The running
@@ -654,9 +853,7 @@ class Sandbox:
             raise
         finally:
             if paused:
-                self._docker("unpause", self.name, check=False)
-                if self.idle_ttl:  # the watchdog's clock kept running while its sleep was frozen: don't let that expire us
-                    self._docker("exec", self.name, "touch", _MARK, check=False)
+                self._unpause(check=False)
 
     def list_snapshots(self):
         """Tags of this sandbox's snapshots, sorted. Named sandboxes only; the owner check applies."""
@@ -715,7 +912,8 @@ def list_sandboxes(host: str | None = None, owner: str | None = None) -> list[Sa
         sb = Sandbox(name=label or None, owner=own or None, host=host)
         if not label:
             sb.name = cname  # anonymous: its random container name is all there is
-        sb._running, sb._has_egress = state == "running", bool(egress)  # a proxy and a network to remove too
+        sb._running, sb._has_egress = state in ("running", "paused"), bool(egress)  # a proxy and a network to remove too
+        sb._paused = state == "paused"
         sb.created = _parse_created(created)
         boxes.append(sb)
     return boxes
@@ -736,6 +934,9 @@ def create_sandbox(
     egress: list[str] | None = None,
     inject: dict[str, dict[str, str]] | None = None,
     ports: list[int] | None = None,
+    env: dict[str, str] | None = None,
+    renewable: bool = False,
+    mounts: dict[str, str] | None = None,
 ) -> Sandbox:
     """Create and start a gVisor sandbox. Use `with create_sandbox(...) as sb:` or call sb.stop() yourself.
 
@@ -769,6 +970,8 @@ def create_sandbox(
               address or a network. A name must resolve to public addresses; reaching a private one takes an IP entry.
               The proxy runs python:3.12-slim (must be on the docker host) under docker's default runtime, runc: under
               gVisor docker's DNS doesn't work. Don't pass network=. Headless only; fixed at creation, like limits.
+              `!entry` shuts a host out and wins over every allow ("*.example.com", "!admin.example.com"; its port
+              defaults to every port). sb.allow() / sb.deny() change the rules later, sb.egress_denied() lists what was refused.
     inject   Credentials the sandbox can use but never holds: {"api.example.com": {"Authorization": "Bearer sk-..."}}. The
               egress proxy ends the sandbox's HTTPS to that host (a certificate authority made for this sandbox, which it
               trusts, and whose key is dropped at once), sets those headers on every request, and sends it on over TLS of
@@ -782,11 +985,24 @@ def create_sandbox(
               With host="ssh://..." that is the remote machine's loopback: tunnel to it (ssh -L). Needs a network the host can
               reach: headless only, not network="none", egress= or inject=. Fixed at creation, like limits. idle_ttl counts
               exec() calls, not connections: use lifetime for a sandbox you are browsing.
+    env      Environment variables for everything that runs in the sandbox: {"MODE": "ci"}. They reach docker through its
+              stdin, not a command line, so a secret doesn't show in `ps`; but the sandbox holds them: for a credential it
+              should only be able to use, see inject=. One line per value. Fixed at creation, like limits: a resumed
+              sandbox keeps the environment of its first start. exec(env=) adds more for one command.
+    mounts   Host directories (or files) to show the sandbox, read-only: {"/data/models": "/models"} is the docker host's
+              /data/models at /models inside. Nothing is copied, so a big dataset costs nothing and changes on the host show
+              up inside; the sandbox can read everything under the path, and can't change any of it. With host="ssh://..."
+              the path is on that machine. Absolute paths; a source that doesn't exist is an error. Not `/`, not /proc, /sys,
+              /dev, /run or a socket. Links inside the directory resolve in the sandbox's own filesystem, so one that points
+              at /etc/passwd shows the sandbox's file, not the host's. Fixed at creation. Use put_dir() for a copy it may edit.
     runtime  The docker runtime, default "runsc". Name a second one (e.g. "runsc-gui", same runsc plus the GUI
               flags) to keep the strict one for headless sandboxes. Must be a gVisor runtime: plain runc is
               refused for gui, which runs --privileged.
     lifetime  Seconds until the sandbox destroys itself, even if your process dies. Headless only.
               Default: lives until stop().
+    renewable True -> sb.renew(seconds) can move the lifetime's deadline later or earlier. Needs lifetime=. The deadline
+              is then a file that PID 1 reads inside the sandbox, so code running in it can extend its own life: leave it
+              off when `lifetime` is a budget for code you don't trust. Fixed at creation.
     idle_ttl  Seconds without an exec() before the sandbox destroys itself, even if your process dies. The clock
               restarts when each exec() starts and ends; background processes don't count. exec(timeout=) must be
               shorter. A named sandbox keeps its files, and create_sandbox(name=same) later makes a fresh
@@ -795,4 +1011,4 @@ def create_sandbox(
               "ssh://user@host" -> docker on a remote VM/server, e.g. an EC2 or Azure VM.
     """
     return Sandbox(image, gui=gui, limits=limits, network=network, lifetime=lifetime, idle_ttl=idle_ttl,
-                   name=name, owner=owner, host=host, runtime=runtime, egress=egress, inject=inject, ports=ports).start()
+                   name=name, owner=owner, host=host, runtime=runtime, egress=egress, inject=inject, ports=ports, env=env, renewable=renewable, mounts=mounts).start()

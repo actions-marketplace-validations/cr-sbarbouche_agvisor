@@ -4,10 +4,15 @@ Configured by environment variables only, so the agent can't pick its own image,
 AGVISOR_HOST (ssh://user@vm; default local docker / $DOCKER_HOST), AGVISOR_IMAGE, AGVISOR_NETWORK (default "none"),
 AGVISOR_CPUS (2), AGVISOR_MEMORY (2g), AGVISOR_IDLE_TTL (600 s), AGVISOR_LIFETIME (3600 s).
 AGVISOR_EGRESS (unset): comma-separated hosts the sandbox may reach (create_sandbox(egress=)), e.g.
-"pypi.org,files.pythonhosted.org"; it replaces AGVISOR_NETWORK.
+"pypi.org,files.pythonhosted.org"; it replaces AGVISOR_NETWORK. A `!host` entry shuts one out ("*.example.com,!admin.example.com").
+The agent can read what was refused (egress_blocked), and you can allow it while it runs: `agvisor allow NAME host`.
 AGVISOR_INJECT (unset): credentials the sandbox can use but never sees, JSON like
 {"api.example.com": {"Authorization": "Bearer sk-..."}} (create_sandbox(inject=); needs agvisor[inject]); those hosts are
 reachable, and it replaces AGVISOR_NETWORK like AGVISOR_EGRESS does.
+AGVISOR_ENV (unset): environment variables for the sandbox, JSON like {"MODE": "ci"} (create_sandbox(env=)). The sandbox holds
+them: for a credential it should only use, AGVISOR_INJECT is the way.
+AGVISOR_MOUNTS (unset): HOST_DIR:/DEST[,HOST_DIR:/DEST...], directories of the docker host shown to the sandbox read-only
+(create_sandbox(mounts=)), e.g. "/data/models:/models". Nothing is copied, and the agent can't change them.
 AGVISOR_PORTS (unset): comma-separated container ports to reach from your machine, e.g. "8000,3000" (create_sandbox(ports=));
 the agent learns the address from the port tool. Needs AGVISOR_NETWORK=bridge or isolated, and no AGVISOR_EGRESS/AGVISOR_INJECT.
 AGVISOR_NAME (unset) makes the sandbox a named one: /workspace is kept in a docker volume, and the snapshot tools
@@ -62,6 +67,41 @@ def _inject():
         raise SystemExit(f'AGVISOR_INJECT must be JSON like {{"api.example.com": {{"Authorization": "Bearer ..."}}}}: {e}') from None
 
 
+def _envvars():
+    """AGVISOR_ENV as {NAME: value}, or None. The values may be secrets: an error never repeats them."""
+    raw = _env("ENV")
+    if not raw:
+        return None
+    try:
+        env = json.loads(raw)
+        Sandbox(env=env)  # the same checks as create_sandbox()
+    except ValueError as e:  # a bad JSON text is one too
+        raise SystemExit(f'AGVISOR_ENV must be JSON like {{"MODE": "ci"}}: {e}') from None
+    return env
+
+
+def _mounts():
+    """AGVISOR_MOUNTS as {host path: path inside}, or None. Checked when the server starts, not on the agent's first call."""
+    raw = _env("MOUNTS")
+    if not raw:
+        return None
+    mounts = {}
+    for spec in raw.split(","):
+        src, _, dest = spec.strip().rpartition(":")  # rpartition: the destination has no ':', a host path may
+        if src in mounts:
+            raise SystemExit(f"AGVISOR_MOUNTS lists {src!r} twice")
+        mounts[src] = dest
+    try:
+        Sandbox(mounts=mounts)  # the same checks as create_sandbox()
+    except ValueError as e:
+        raise SystemExit(f"AGVISOR_MOUNTS must be HOST_DIR:/DEST, comma-separated: {e}") from None
+    if not (_env("HOST") or os.environ.get("DOCKER_HOST")):  # docker is on this machine: a missing path is a mistake to report now
+        missing = [src for src in mounts if not os.path.exists(src)]
+        if missing:
+            raise SystemExit(f"AGVISOR_MOUNTS: {', '.join(missing)} does not exist")
+    return mounts
+
+
 def _snapshots():
     """AGVISOR_SNAPSHOTS as an int >= 1: every snapshot is a full copy of /workspace, so the agent gets a fixed number."""
     try:
@@ -98,7 +138,7 @@ def _get():
             net = {**({"egress": egress} if egress else {}), **({"inject": inject} if inject else {})}
             sb = create_sandbox(
                 _env("IMAGE"), host=_env("HOST"), name=_env("NAME"),
-                **(net or {"network": _env("NETWORK", "none")}), ports=_ports(),
+                **(net or {"network": _env("NETWORK", "none")}), ports=_ports(), env=_envvars(), mounts=_mounts(),
                 limits=Limits(cpus=float(_env("CPUS", 2)), memory=_env("MEMORY", "2g")),
                 idle_ttl=int(_env("IDLE_TTL", 600)), lifetime=int(_env("LIFETIME", 3600)))
             try:
@@ -186,17 +226,22 @@ def edit_file(path: str, old: str, new: str) -> str:
     return f"edited {path}"
 
 
-def python(code: str, timeout: int = 60, restart: bool = False) -> str:
+def python(code: str, timeout: int = 60, restart: bool = False, context: str = "") -> str:
     """Run Python in the sandbox in a session that keeps variables, imports and functions between calls, like notebook
     cells: load data once, then explore it with small calls. The value of the last expression is printed. Output is
     stdout and stderr merged (the last ~30 KB). At `timeout` seconds the call raises TimeoutError and the session
     survives; `restart=True` starts a fresh session first. The session is lost when the sandbox is reset or
-    deleted. Needs python3 in the sandbox image."""
+    deleted. Needs python3 in the sandbox image.
+
+    `context` (letters, digits, _ and -; default none) names a separate session with its own variables: use one per
+    task when you work on several things at once. They share the sandbox's memory, so don't open many."""
     try:
         sb = _get()
-        r = sb.python(code, timeout=max(1, _t(sb, timeout + 5) - 5), restart=restart)  # exec() gives up 5 s after it
+        r = sb.python(code, timeout=max(1, _t(sb, timeout + 5) - 5), restart=restart, context=context or None)  # exec() gives up 5 s after it
     except SandboxGone as e:
         return _gone(e)
+    except ValueError as e:  # a context name that isn't valid
+        return str(e)
     if r.returncode == 124:  # stuck where the alarm can't reach (a C call): the session was killed
         return f"timed out after {timeout} s and the python session was killed: its variables are gone"
     return (r.stdout or "(no output)") + (f"\n[exit {r.returncode}]" if r.returncode else "")
@@ -275,6 +320,16 @@ def stats() -> str:
             f"processes {s['pids']} (limit {sb.limits.pids})")
 
 
+def egress_blocked() -> str:
+    """The hosts this sandbox tried to reach that the user's network rules refused, as host:port, one per line, in the order
+    it first tried. When a command fails on the network (a 403 from the proxy, a failed `pip install`), look here, then tell
+    the user which host you need and why: you can't change the rules, they can. A host they have allowed since is not listed."""
+    try:
+        return "\n".join(_get().egress_denied()) or "nothing was refused"
+    except SandboxGone as e:
+        return _gone(e)
+
+
 def reset() -> str:
     """Destroy the sandbox and everything in it. The next run() starts a fresh one. With snapshot/restore tools,
     /workspace survives: use restore() to roll that back."""
@@ -326,9 +381,11 @@ def delete_snapshot(tag: str) -> str:
 
 
 def main():
-    _put()  # a bad AGVISOR_PUT_DIR, AGVISOR_SNAPSHOTS or AGVISOR_INJECT stops the server here
+    _put()  # a bad AGVISOR_PUT_DIR, AGVISOR_SNAPSHOTS, AGVISOR_INJECT, AGVISOR_ENV or AGVISOR_MOUNTS stops the server here
     _snapshots()
     _inject()
+    _envvars()
+    _mounts()
     ports = _ports()
     try:
         from mcp.server.mcpserver import MCPServer  # mcp 2.x: v1's FastMCP was renamed
@@ -346,6 +403,8 @@ def main():
     app.tool()(kill_job)
     app.tool()(reset)
     app.tool()(stats)
+    if _env("EGRESS") or _env("INJECT"):  # a sandbox with an allowlist: say what it refused
+        app.tool()(egress_blocked)
     if ports:
         app.tool()(port)
     if _env("NAME"):  # snapshots need a named sandbox
