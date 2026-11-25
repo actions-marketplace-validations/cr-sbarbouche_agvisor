@@ -62,13 +62,13 @@ with create_sandbox(image, host=host, lifetime=600) as sb:
         raise AssertionError("a removed sandbox answered")
 
 # idle_ttl: a sandbox parked for longer than idle_ttl must not expire the moment it wakes (the watchdog's clock ran on)
-with create_sandbox(image, host=host, idle_ttl=20) as sb:
-    sb.exec("true")
+with create_sandbox(image, host=host, idle_ttl=20) as sb:  # exec(timeout=) must stay under idle_ttl
+    sb.exec("true", timeout=10)
     sb.pause()
     time.sleep(35)  # idle_ttl and then some
     sb.resume()
     time.sleep(8)  # the watchdog looks every 5 s: long enough for it to have expired us, were it going to
-    assert sb.exec("echo alive").stdout == "alive\n"
+    assert sb.exec("echo alive", timeout=10).stdout == "alive\n"
     print("idle_ttl=20: alive 8 s after a 35 s pause")
 
 # lifetime during a pause: not asserted, because what gVisor does with its clocks while paused was not known when this

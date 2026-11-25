@@ -5,7 +5,8 @@ api.anthropic.com and nothing else; the proxy adds the real key to its requests,
     AGVISOR_HOST=ssh://user@my-vm ANTHROPIC_API_KEY=... uv run --extra inject python examples/10_agent_cli.py   # docker on another machine
 
 Without ANTHROPIC_API_KEY it installs the CLI and shows the same setup with a placeholder key: the API refuses that, which still shows a
-request got through. Needs the node:22-slim and python:3.12-slim images on the docker host (the second runs the egress proxy), and
+request got through. Needs the node:22 and python:3.12-slim images on the docker host (the second runs the egress proxy; the first has to bring
+a CA bundle, which inject= needs: node:22-slim has none), and
 `pip install 'agvisor[inject]'` (this script runs under `uv run --extra inject`).
 """
 import os
@@ -17,7 +18,7 @@ KEY = os.environ.get("ANTHROPIC_API_KEY")
 PLACEHOLDER = "sk-ant-placeholder-the-proxy-sets-the-real-one"
 
 with create_sandbox(
-    "node:22-slim", host=HOST, limits=Limits(memory="3g"), lifetime=1800,
+    "node:22", host=HOST, limits=Limits(memory="3g"), lifetime=1800,
     # the only hosts it can reach: npm for the install, and the API, which gets the key added on the way
     egress=["registry.npmjs.org"],
     inject={"api.anthropic.com": {"x-api-key": KEY or "placeholder-not-a-real-key"}},

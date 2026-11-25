@@ -623,7 +623,7 @@ def test_egress_args():
         verbs = [c[0][:2] if c[0][0] in ("network", "volume") else c[0][:1] for c in calls]
         # orphans first, then leftovers of the same name, then proxy -> network -> attach -> its address -> sandbox
         assert verbs[4:] == [["ps"], ["network", "prune"], ["rm"], ["network", "rm"], ["run"], ["network", "create"],
-                             ["network", "connect"], ["inspect"], ["run"]], verbs
+                             ["network", "connect"], ["inspect"], ["exec"], ["run"]], verbs  # exec: wait until the proxy is up
         proxy, create, connect, _, box = [c for c in calls if c[0][0] in ("run", "network", "inspect") and c[0][1] not in ("rm", "prune")][-5:]
         assert create[0] == ["network", "create", "--internal", "--label=agvisor.egress=1", "agvisor_net_proj"]
         assert connect[0] == ["network", "connect", "agvisor_net_proj", "agvisor_proxy_proj"]  # no DNS alias: gVisor has no 127.0.0.11
@@ -644,9 +644,32 @@ def test_egress_args():
 
         calls.clear()  # an anonymous sandbox has no leftovers of its name to remove first
         create_sandbox(egress=["pypi.org"]).stop()
-        assert [c[0][:2] for c in calls] == [["ps", "-a"], ["network", "prune"], ["run", "-d"], ["network", "create"],
-                                             ["network", "connect"], ["inspect", "-f"], ["run", "-d"], ["rm", "-f"], ["rm", "-f"],
-                                             ["network", "rm"]]
+        seq = [c[0][:2] for c in calls]
+        assert seq[6][0] == "exec" and seq[6][1].startswith("agvisor_proxy_")  # waits for the proxy, by its (random) name
+        seq[6] = ["exec"]
+        assert seq == [["ps", "-a"], ["network", "prune"], ["run", "-d"], ["network", "create"], ["network", "connect"],
+                       ["inspect", "-f"], ["exec"], ["run", "-d"], ["rm", "-f"], ["rm", "-f"], ["network", "rm"]]
+        wait = calls[6][0]  # sh -c: until the rules file exists, which the proxy writes once it listens; it is in the proxy, not the sandbox
+        assert wait[0] == "exec" and wait[2:4] == ["sh", "-c"] and "/run/agvisor/rules" in wait[-1] and "seq 100" in wait[-1] and wait[-1].endswith("exit 1")
+        calls.clear()  # a proxy that never comes up: an error that says why, and nothing left behind
+        real = run
+
+        def no_proxy(cmd, **kw):
+            if cmd[1] == "exec" and "sh" in cmd:
+                calls.append(cmd[1:])
+                return subprocess.CompletedProcess(cmd, 1, "", "")
+            if cmd[1] == "logs":
+                return subprocess.CompletedProcess(cmd, 0, "Traceback: boom\n", "")
+            return real(cmd, **kw)
+
+        with mock.patch("agvisor.sandbox.subprocess.run", no_proxy):
+            try:
+                create_sandbox(egress=["pypi.org"])
+            except RuntimeError as e:
+                assert "did not start" in str(e) and "boom" in str(e)
+            else:
+                raise AssertionError("a proxy that never listens must be an error")
+        assert not any(c[0] == "run" and "ubuntu:24.04" in c for c in calls)  # the sandbox was never started
 
         # orphans: a proxy whose sandbox expired (--rm) is removed once it is old enough, its network pruned after it
         now = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S +0000 UTC")
@@ -716,7 +739,7 @@ def test_inject_args():
     calls.clear()  # no inject: no CA, no trust step, no tmpfs
     with mock.patch("agvisor.sandbox.subprocess.run", run), mock.patch("agvisor.sandbox._ca.make", lambda hosts: 1 / 0):
         create_sandbox(egress=["pypi.org"])
-    assert not any("--tmpfs=/tmp:rw,noexec,nosuid,size=1m,mode=1777" in c[0] or c[0][0] == "exec" for c in calls)
+    assert not any("--tmpfs=/tmp:rw,noexec,nosuid,size=1m,mode=1777" in c[0] or c[0][:2] == ["exec", "-i"] for c in calls)  # (the proxy's readiness exec has no -i)
 
     calls.clear()  # no cryptography package: an error before anything is started
     with mock.patch("agvisor.sandbox.subprocess.run", run), mock.patch("agvisor.sandbox._ca.make", mock.Mock(side_effect=RuntimeError("inject= needs the cryptography package"))):
@@ -2247,6 +2270,29 @@ def test_pause_resume():
         assert sb.exec("false").returncode == 1
         out.update(rc=2, err="Error response from daemon: Container x is paused")  # only docker's exit code 1
         assert sb.exec("false").returncode == 2
+
+    # stop() of a paused sandbox thaws it first (docker can't remove what is frozen); a running one is just removed
+    out.update(rc=0, err="")
+    box = Sandbox(name="proj")
+    with mock.patch("agvisor.sandbox.subprocess.run", run):
+        box.pause()
+        assert box._paused
+        calls.clear()
+        box.stop()
+        assert calls == [["unpause", "agvisor-proj"], ["rm", "-f", "agvisor-proj"]] and not box._paused
+        calls.clear()
+        box.stop()
+        assert calls == [["rm", "-f", "agvisor-proj"]]  # once is enough
+        box.pause()
+        box.resume()
+        calls.clear()
+        box.stop()
+        assert calls == [["rm", "-f", "agvisor-proj"]] and not box._paused  # resumed: nothing to thaw
+        calls.clear()
+        listed = Sandbox(name="proj")
+        listed._paused = True  # what list_sandboxes() sets for a paused container
+        listed.stop()
+        assert calls == [["unpause", "agvisor-proj"], ["rm", "-f", "agvisor-proj"]]
 
     # snapshot still unpauses what it paused, through the same helper
     calls.clear()
