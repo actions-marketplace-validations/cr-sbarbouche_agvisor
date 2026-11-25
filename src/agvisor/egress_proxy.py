@@ -332,8 +332,6 @@ async def main():
     path = os.environ.get("AGVISOR_RULES", RULES_FILE)  # ponytail: the env var is only for the tests
     entries = [e.lower() for e in os.environ["AGVISOR_ALLOW"].split(",")]
     allow, deny = parse_policy(entries)
-    with open(path, "w") as f:  # what edit() changes, and what the host reads back
-        f.write("".join(e + "\n" for e in entries))
     tunnels = set()
 
     def reload():  # SIGHUP: edit() wrote a new file
@@ -350,6 +348,8 @@ async def main():
     asyncio.get_running_loop().add_signal_handler(signal.SIGHUP, reload)
     server = await serve(allow, os.environ["AGVISOR_TOKEN"], port=int(os.environ.get("AGVISOR_PORT", PORT)),  # ponytail: the port is only for the tests
                          inject=inject, server_ctx=server_ctx, upstream_ctx=upstream_ctx, deny=deny, tunnels=tunnels)
+    with open(path, "w") as f:  # what edit() changes and the host reads back; it exists once we listen: the host waits for it
+        f.write("".join(e + "\n" for e in entries))
     await server.serve_forever()
 
 

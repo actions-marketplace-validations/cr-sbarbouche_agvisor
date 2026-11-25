@@ -281,7 +281,7 @@ class Sandbox:
         self.data_dir = (GUI_HOME if gui else "/workspace") if self.persistent else None  # survives stop()
         self.rdp_port = self.password = None  # set by start() when gui; user is GUI_USER
         self._running = False
-        self._paused = False  # only list_sandboxes() knows: a handle from create_sandbox() doesn't track it
+        self._paused = False  # pause() and resume() keep it; list_sandboxes() sets it from docker's state
 
     def _docker(self, *args, input=None, check=True):
         cmd = ["docker", *(["-H", self.host] if self.host else []), *args]
@@ -435,6 +435,11 @@ class Sandbox:
         self._docker("network", "create", "--internal", "--label=agvisor.egress=1", self._net)
         self._docker("network", "connect", self._net, self._proxy)
         ip = self._docker("inspect", "-f", f'{{{{(index .NetworkSettings.Networks "{self._net}").IPAddress}}}}', self._proxy).stdout.strip()
+        # the proxy writes its rules file once it listens: until then a request, or allow() / egress_rules(), would find nothing
+        wait = f"for i in $(seq 100); do [ -s {egress_proxy.RULES_FILE} ] && exit 0; sleep 0.1; done; exit 1"
+        if self._docker("exec", self._proxy, "sh", "-c", wait, check=False).returncode:
+            logs = self._docker("logs", "--tail", "20", self._proxy, check=False)
+            raise RuntimeError(f"the egress proxy did not start within 10 s: {(logs.stdout + logs.stderr).strip()[-300:]}")
         url = f"http://agvisor:{token}@{ip}:{egress_proxy.PORT}"
         skip = "localhost,127.0.0.1,::1"
         trust = [(k, f"{_CA_DIR}/bundle.pem") for k in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE", "GIT_SSL_CAINFO")]
@@ -717,6 +722,9 @@ class Sandbox:
 
     def stop(self):
         """Remove the container and free its CPU/RAM. A named sandbox keeps its data volume."""
+        if self._paused:  # docker can't remove what is frozen: thaw it first
+            self._docker("unpause", self.name, check=False)
+            self._paused = False
         self._docker("rm", "-f", self.name, check=False)
         if self._has_egress:
             self._egress_down()
@@ -830,10 +838,12 @@ class Sandbox:
         checked whether gVisor's stops it), and resume() restarts the `idle_ttl` clock, so a sandbox that waited longer
         than that doesn't expire the moment it wakes. RuntimeError, with docker's words, if it is already paused or not running."""
         self._docker("pause", self.name)
+        self._paused = True
 
     def resume(self):
         """Undo pause(). RuntimeError, with docker's words, if it is not paused."""
         self._unpause()
+        self._paused = False
 
     def snapshot(self, tag):
         """Save a copy of the data dir (/workspace) as `tag`, replacing a snapshot of that name. Named sandboxes only.
